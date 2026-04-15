@@ -1,8 +1,10 @@
 module SagaHttp
 
+import Std.Actor (Process)
+
 opaque type Socket = Socket
 
-# -- TCP primitives --
+# -- TCP --
 
 @external("erlang", "SagaHttp.bridge", "listen")
 pub fun listen : (port: Int) -> (backlog: Int) -> Result Socket String
@@ -22,7 +24,7 @@ pub fun close : (socket: Socket) -> Unit
 @external("erlang", "SagaHttp.bridge", "peername")
 pub fun peername : (socket: Socket) -> Result (String, Int) String
 
-# -- HTTP parsing --
+# -- HTTP --
 
 pub type HeaderResult =
   | Header String String String
@@ -38,7 +40,6 @@ pub record Request {
   headers: Dict String String,
   path: String,
   method: String,
-  # body: Maybe String,
 }
 
 pub record Response {
@@ -76,7 +77,6 @@ encode_response resp = {
     <> resp.body
 }
 
-# Parse the request line and headers from raw bytes
 fun parse_request : String -> Result Request String
 parse_request input = do {
   Ok (method, path, rest) <- decode_request_line input
@@ -88,7 +88,7 @@ parse_request input = do {
 
 fun decode_headers : Dict String String -> String -> Result (Dict String String, String) String
 decode_headers headers text = case decode_header text {
-  Ok (Header key value rest) -> decode_headers (Dict.put key value headers) rest
+  Ok (Header key value rest) -> decode_headers (Dict.put (String.to_lower key) value headers) rest
   Ok (Done rest) -> Ok (headers, rest)
   Err e -> Err e
 }
@@ -100,38 +100,41 @@ text status body = Response {
   body: body,
 }
 
-# Handle a single connection: read, parse, call fn, respond, close.
+# Reads requests in a loop until the client disconnects, times out,
+# or sends Connection: close.
 pub fun handle_connection : Socket -> (Request -> Response) -> Unit
 handle_connection socket on_request = {
-  let result = do {
-    Ok data <- recv socket 0 30000
-    Ok req <- parse_request data
-    Ok (on_request req)
-  } else {
-    Err e -> Err e
-  }
-  case result {
-    Ok resp -> {
-      let _ = send socket (encode_response resp)
-      close socket
-    }
+  case recv socket 0 30000 {
     Err _ -> close socket
+    Ok data -> case parse_request data {
+      Err _ -> close socket
+      Ok req -> {
+        let resp = on_request req
+        let _ = send socket (encode_response resp)
+        case Dict.get "connection" req.headers {
+          Just "close" -> close socket
+          _ -> handle_connection socket on_request
+        }
+      }
+    }
   }
 }
 
 pub fun serve : Int -> (Request -> Response) -> Result Unit String
+  needs {Process}
 serve port on_request = do {
-  Ok listener <- listen port 128
+  Ok listener <- listen port 1024
   Ok (accept_loop listener on_request)
 } else {
   Err e -> Err e
 }
 
 fun accept_loop : Socket -> (Request -> Response) -> Unit
+  needs {Process}
 accept_loop listener on_request = {
   case accept listener {
     Ok socket -> {
-      handle_connection socket on_request
+      let _ = spawn! (fun () -> handle_connection socket on_request)
       accept_loop listener on_request
     }
     Err _ -> accept_loop listener on_request

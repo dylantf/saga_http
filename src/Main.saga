@@ -1,5 +1,6 @@
 module Main
 
+import Std.Actor (beam_actor)
 import SagaHttp (serve, text, Request, Response)
 
 fun handle : Request -> Response
@@ -7,4 +8,4 @@ handle req = text 200 $"Hello, you requested {req.path}"
 
 main () = {
   serve 8080 handle
-}
+} with beam_actor
