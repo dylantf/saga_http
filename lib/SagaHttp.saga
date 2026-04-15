@@ -1,17 +1,139 @@
 module SagaHttp
 
+opaque type Socket = Socket
+
+# -- TCP primitives --
+
+@external("erlang", "SagaHttp.bridge", "listen")
+pub fun listen : (port: Int) -> (backlog: Int) -> Result Socket String
+
+@external("erlang", "SagaHttp.bridge", "accept")
+pub fun accept : (socket: Socket) -> Result Socket String
+
+@external("erlang", "SagaHttp.bridge", "recv")
+pub fun recv : (socket: Socket) -> (length: Int) -> (timeout: Int) -> Result String String
+
+@external("erlang", "SagaHttp.bridge", "send")
+pub fun send : (socket: Socket) -> (data: String) -> Result Unit String
+
+@external("erlang", "SagaHttp.bridge", "close")
+pub fun close : (socket: Socket) -> Unit
+
+@external("erlang", "SagaHttp.bridge", "peername")
+pub fun peername : (socket: Socket) -> Result (String, Int) String
+
+# -- HTTP parsing --
+
+pub type HeaderResult =
+  | Header String String String
+  | Done String
+
+@external("erlang", "SagaHttp.bridge", "decode_request_line")
+fun decode_request_line : (data: String) -> Result (String, String, String) String
+
+@external("erlang", "SagaHttp.bridge", "decode_header")
+fun decode_header : (data: String) -> Result HeaderResult String
+
 pub record Request {
-  method: String,
+  headers: Dict String String,
   path: String,
+  method: String,
+  # body: Maybe String,
 }
 
 pub record Response {
-  status : Int,
-  body : String,
+  headers: Dict String String,
+  status: Int,
+  body: String,
+}
+
+fun status_text : Int -> String
+status_text code = case code {
+  200 -> "OK"
+  201 -> "Created"
+  204 -> "No Content"
+  400 -> "Bad Request"
+  404 -> "Not Found"
+  500 -> "Internal Server Error"
+  _ -> "Unknown"
+}
+
+fun encode_headers : Dict String String -> String
+encode_headers headers =
+  Dict.to_list headers
+  |> List.foldl (fun acc entry -> {
+    let (key, value) = entry
+    acc <> key <> ": " <> value <> "\r\n"
+  }) ""
+
+fun encode_response : Response -> String
+encode_response resp = {
+  let body_len = show (String.byte_size resp.body)
+  let headers = Dict.put "Content-Length" body_len resp.headers
+  $"HTTP/1.1 {show resp.status} {status_text resp.status}\r\n"
+    <> encode_headers headers
+    <> "\r\n"
+    <> resp.body
+}
+
+# Parse the request line and headers from raw bytes
+fun parse_request : String -> Result Request String
+parse_request input = do {
+  Ok (method, path, rest) <- decode_request_line input
+  Ok (headers, _rest) <- decode_headers (Dict.new ()) rest
+  Ok (Request { method: method, path: path, headers: headers })
+} else {
+  _ -> Err "failed to parse request"
+}
+
+fun decode_headers : Dict String String -> String -> Result (Dict String String, String) String
+decode_headers headers text = case decode_header text {
+  Ok (Header key value rest) -> decode_headers (Dict.put key value headers) rest
+  Ok (Done rest) -> Ok (headers, rest)
+  Err e -> Err e
 }
 
 pub fun text : Int -> String -> Response
-text status body = Response { status: status, body: body }
+text status body = Response {
+  status: status,
+  headers: Dict.from_list [("Content-Type", "text/plain")],
+  body: body,
+}
 
-@external("erlang", "SagaHttp.bridge", "start")
-pub fun start : Int -> (Request -> Response) -> Unit
+# Handle a single connection: read, parse, call fn, respond, close.
+pub fun handle_connection : Socket -> (Request -> Response) -> Unit
+handle_connection socket on_request = {
+  let result = do {
+    Ok data <- recv socket 0 30000
+    Ok req <- parse_request data
+    Ok (on_request req)
+  } else {
+    Err e -> Err e
+  }
+  case result {
+    Ok resp -> {
+      let _ = send socket (encode_response resp)
+      close socket
+    }
+    Err _ -> close socket
+  }
+}
+
+pub fun serve : Int -> (Request -> Response) -> Result Unit String
+serve port on_request = do {
+  Ok listener <- listen port 128
+  Ok (accept_loop listener on_request)
+} else {
+  Err e -> Err e
+}
+
+fun accept_loop : Socket -> (Request -> Response) -> Unit
+accept_loop listener on_request = {
+  case accept listener {
+    Ok socket -> {
+      handle_connection socket on_request
+      accept_loop listener on_request
+    }
+    Err _ -> accept_loop listener on_request
+  }
+}

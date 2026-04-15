@@ -7,6 +7,3 @@ main = "src/Main.saga"
 [library]
 module = "SagaHttp"
 expose = ["SagaHttp"]
-
-[deps]
-cowboy = { version = "2.14.2" }
