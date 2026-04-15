@@ -1,0 +1,17 @@
+module SagaHttp
+
+pub record Request {
+  method: String,
+  path: String,
+}
+
+pub record Response {
+  status : Int,
+  body : String,
+}
+
+pub fun text : Int -> String -> Response
+text status body = Response { status: status, body: body }
+
+@external("erlang", "SagaHttp.bridge", "start")
+pub fun start : Int -> (Request -> Response) -> Unit

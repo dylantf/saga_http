@@ -1,0 +1,20 @@
+module Main
+
+import Std.IO (console)
+import Std.Actor (beam_actor, Timer)
+import SagaHttp (start, text, Request, Response)
+
+fun handle : Request -> Response
+handle _req = text 200 "Hello from Saga!"
+
+fun wait_forever : Unit -> Unit needs {Timer}
+wait_forever () = {
+  sleep! 60000
+  wait_forever ()
+}
+
+main () = {
+  start 8080 handle
+  println "Listening on port 8080"
+  wait_forever ()
+} with { console, beam_actor }
