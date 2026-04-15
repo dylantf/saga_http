@@ -4,7 +4,10 @@ import Std.Actor (beam_actor)
 import SagaHttp (serve, text, Request, Response)
 
 fun handle : Request -> Response
-handle req = text 200 $"Hello, you requested {req.path}"
+handle req = case req.body {
+  Just body -> text 200 $"Got body: {body}"
+  Nothing -> text 200 $"Hello, you requested {req.path}"
+}
 
 main () = {
   serve 8080 handle

@@ -40,6 +40,7 @@ pub record Request {
   headers: Dict String String,
   path: String,
   method: String,
+  body: Maybe String,
 }
 
 pub record Response {
@@ -77,18 +78,36 @@ encode_response resp = {
     <> resp.body
 }
 
-fun parse_request : String -> Result Request String
-parse_request input = do {
+fun parse_request : Socket -> String -> Result Request String
+parse_request socket input = do {
   Ok (method, path, rest) <- decode_request_line input
-  Ok (headers, _rest) <- decode_headers (Dict.new ()) rest
-  Ok (Request { method: method, path: path, headers: headers })
+  Ok (headers, rest) <- decode_headers (Dict.new ()) rest
+  Ok body <- read_body socket headers rest
+  Ok (Request { method: method, path: path, headers: headers, body: body })
 } else {
   _ -> Err "failed to parse request"
 }
 
+fun read_body : Socket -> Dict String String -> String -> Result (Maybe String) String
+read_body socket headers rest = case Dict.get "content-length" headers {
+  Nothing -> Ok Nothing
+  Just len_str -> case Int.parse len_str {
+    Nothing -> Err "invalid content-length"
+    Just len -> {
+      let have = String.byte_size rest
+      if have >= len then Ok (Just (String.slice 0 len rest))
+      else case recv socket (len - have) 30000 {
+        Err e -> Err e
+        Ok more -> Ok (Just (rest <> more))
+      }
+    }
+  }
+}
+
 fun decode_headers : Dict String String -> String -> Result (Dict String String, String) String
 decode_headers headers text = case decode_header text {
-  Ok (Header key value rest) -> decode_headers (Dict.put (String.to_lower key) value headers) rest
+  Ok (Header key value rest) ->
+    decode_headers (Dict.put (String.to_lower key) value headers) rest
   Ok (Done rest) -> Ok (headers, rest)
   Err e -> Err e
 }
@@ -106,7 +125,7 @@ pub fun handle_connection : Socket -> (Request -> Response) -> Unit
 handle_connection socket on_request = {
   case recv socket 0 30000 {
     Err _ -> close socket
-    Ok data -> case parse_request data {
+    Ok data -> case parse_request socket data {
       Err _ -> close socket
       Ok req -> {
         let resp = on_request req
@@ -129,8 +148,7 @@ serve port on_request = do {
   Err e -> Err e
 }
 
-fun accept_loop : Socket -> (Request -> Response) -> Unit
-  needs {Process}
+fun accept_loop : Socket -> (Request -> Response) -> Unit needs {Process}
 accept_loop listener on_request = {
   case accept listener {
     Ok socket -> {
