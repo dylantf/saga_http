@@ -1,0 +1,22 @@
+module SagaHttp.Tcp
+
+opaque type Socket = Socket
+opaque type ListenSocket = ListenSocket
+
+@external("erlang", "SagaHttp.bridge", "listen")
+pub fun listen : (port: Int) -> (backlog: Int) -> Result ListenSocket String
+
+@external("erlang", "SagaHttp.bridge", "accept")
+pub fun accept : (socket: ListenSocket) -> Result Socket String
+
+@external("erlang", "SagaHttp.bridge", "recv")
+pub fun recv : (socket: Socket) -> (length: Int) -> (timeout: Int) -> Result String String
+
+@external("erlang", "SagaHttp.bridge", "send")
+pub fun send : (socket: Socket) -> (data: String) -> Result Unit String
+
+@external("erlang", "SagaHttp.bridge", "close")
+pub fun close : (socket: Socket) -> Unit
+
+@external("erlang", "SagaHttp.bridge", "peername")
+pub fun peername : (socket: Socket) -> Result (String, Int) String

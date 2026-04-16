@@ -74,9 +74,9 @@ decode_header(Data) ->
                     is_binary(Name) -> Name;
                     true -> iolist_to_binary(io_lib:format("~p", [Name]))
                 end,
-            {ok, {sagahttp_Header, NameBin, Value, Rest}};
+            {ok, {sagahttp_http_Header, NameBin, Value, Rest}};
         {ok, http_eoh, Rest} ->
-            {ok, {sagahttp_Done, Rest}};
+            {ok, {sagahttp_http_Done, Rest}};
         {more, _} ->
             {error, <<"incomplete">>};
         {error, _Reason} ->

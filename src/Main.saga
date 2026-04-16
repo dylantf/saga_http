@@ -1,7 +1,7 @@
 module Main
 
 import Std.Actor (beam_actor)
-import SagaHttp (serve, text, Request, Response)
+import SagaHttp.Http (serve, text, Request, Response)
 
 fun handle : Request -> Response
 handle req = case req.body {

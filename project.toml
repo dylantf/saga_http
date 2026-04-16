@@ -6,4 +6,4 @@ main = "src/Main.saga"
 
 [library]
 module = "SagaHttp"
-expose = ["SagaHttp"]
+expose = ["SagaHttp.Tcp", "SagaHttp.Http"]

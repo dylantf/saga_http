@@ -1,32 +1,11 @@
-module SagaHttp
+module SagaHttp.Http
 
 import Std.Actor (Process)
+import SagaHttp.Tcp
 
-opaque type Socket = Socket
+# -- Parsing primitives --
 
-# -- TCP --
-
-@external("erlang", "SagaHttp.bridge", "listen")
-pub fun listen : (port: Int) -> (backlog: Int) -> Result Socket String
-
-@external("erlang", "SagaHttp.bridge", "accept")
-pub fun accept : (socket: Socket) -> Result Socket String
-
-@external("erlang", "SagaHttp.bridge", "recv")
-pub fun recv : (socket: Socket) -> (length: Int) -> (timeout: Int) -> Result String String
-
-@external("erlang", "SagaHttp.bridge", "send")
-pub fun send : (socket: Socket) -> (data: String) -> Result Unit String
-
-@external("erlang", "SagaHttp.bridge", "close")
-pub fun close : (socket: Socket) -> Unit
-
-@external("erlang", "SagaHttp.bridge", "peername")
-pub fun peername : (socket: Socket) -> Result (String, Int) String
-
-# -- HTTP --
-
-pub type HeaderResult =
+type HeaderResult =
   | Header String String String
   | Done String
 
@@ -36,17 +15,28 @@ fun decode_request_line : (data: String) -> Result (String, String, String) Stri
 @external("erlang", "SagaHttp.bridge", "decode_header")
 fun decode_header : (data: String) -> Result HeaderResult String
 
+# -- Types --
+
 pub record Request {
-  headers: Dict String String,
-  path: String,
   method: String,
+  path: String,
+  headers: Dict String String,
   body: Maybe String,
 }
 
 pub record Response {
-  headers: Dict String String,
   status: Int,
+  headers: Dict String String,
   body: String,
+}
+
+# -- Response helpers --
+
+pub fun text : Int -> String -> Response
+text status body = Response {
+  status: status,
+  headers: Dict.from_list [("Content-Type", "text/plain")],
+  body: body,
 }
 
 fun status_text : Int -> String
@@ -78,7 +68,9 @@ encode_response resp = {
     <> resp.body
 }
 
-fun parse_request : Socket -> String -> Result Request String
+# -- Request parsing --
+
+fun parse_request : Tcp.Socket -> String -> Result Request String
 parse_request socket input = do {
   Ok (method, path, rest) <- decode_request_line input
   Ok (headers, rest) <- decode_headers (Dict.new ()) rest
@@ -86,22 +78,6 @@ parse_request socket input = do {
   Ok (Request { method: method, path: path, headers: headers, body: body })
 } else {
   _ -> Err "failed to parse request"
-}
-
-fun read_body : Socket -> Dict String String -> String -> Result (Maybe String) String
-read_body socket headers rest = case Dict.get "content-length" headers {
-  Nothing -> Ok Nothing
-  Just len_str -> case Int.parse len_str {
-    Nothing -> Err "invalid content-length"
-    Just len -> {
-      let have = String.byte_size rest
-      if have >= len then Ok (Just (String.slice 0 len rest))
-      else case recv socket (len - have) 30000 {
-        Err e -> Err e
-        Ok more -> Ok (Just (rest <> more))
-      }
-    }
-  }
 }
 
 fun decode_headers : Dict String String -> String -> Result (Dict String String, String) String
@@ -112,26 +88,37 @@ decode_headers headers text = case decode_header text {
   Err e -> Err e
 }
 
-pub fun text : Int -> String -> Response
-text status body = Response {
-  status: status,
-  headers: Dict.from_list [("Content-Type", "text/plain")],
-  body: body,
+fun read_body : Tcp.Socket -> Dict String String -> String -> Result (Maybe String) String
+read_body socket headers rest = case Dict.get "content-length" headers {
+  Nothing -> Ok Nothing
+  Just len_str -> case Int.parse len_str {
+    Nothing -> Err "invalid content-length"
+    Just len -> {
+      let have = String.byte_size rest
+      if have >= len then Ok (Just (String.slice 0 len rest))
+      else case Tcp.recv socket (len - have) 30000 {
+        Err e -> Err e
+        Ok more -> Ok (Just (rest <> more))
+      }
+    }
+  }
 }
+
+# -- Server --
 
 # Reads requests in a loop until the client disconnects, times out,
 # or sends Connection: close.
-pub fun handle_connection : Socket -> (Request -> Response) -> Unit
+pub fun handle_connection : Tcp.Socket -> (Request -> Response) -> Unit
 handle_connection socket on_request = {
-  case recv socket 0 30000 {
-    Err _ -> close socket
+  case Tcp.recv socket 0 30000 {
+    Err _ -> Tcp.close socket
     Ok data -> case parse_request socket data {
-      Err _ -> close socket
+      Err _ -> Tcp.close socket
       Ok req -> {
         let resp = on_request req
-        let _ = send socket (encode_response resp)
+        let _ = Tcp.send socket (encode_response resp)
         case Dict.get "connection" req.headers {
-          Just "close" -> close socket
+          Just "close" -> Tcp.close socket
           _ -> handle_connection socket on_request
         }
       }
@@ -142,15 +129,16 @@ handle_connection socket on_request = {
 pub fun serve : Int -> (Request -> Response) -> Result Unit String
   needs {Process}
 serve port on_request = do {
-  Ok listener <- listen port 1024
+  Ok listener <- Tcp.listen port 1024
   Ok (accept_loop listener on_request)
 } else {
   Err e -> Err e
 }
 
-fun accept_loop : Socket -> (Request -> Response) -> Unit needs {Process}
+fun accept_loop : Tcp.ListenSocket -> (Request -> Response) -> Unit
+  needs {Process}
 accept_loop listener on_request = {
-  case accept listener {
+  case Tcp.accept listener {
     Ok socket -> {
       let _ = spawn! (fun () -> handle_connection socket on_request)
       accept_loop listener on_request
