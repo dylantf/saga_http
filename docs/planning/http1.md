@@ -18,11 +18,15 @@
 - [x] Header size limits - configurable `max_header_size`, `max_chunk_line_size`, `max_trailer_size` on `Config`
 - [x] 100 Continue - interim `100 Continue` for HTTP/1.1 clients with `Expect: 100-continue`; ignored for HTTP/1.0; unsupported Expect values → 417
 - [x] Multi-value headers - headers are now `List (String, String)` preserving order and duplicates; helpers `find_header` (first match, case-insensitive) and `find_all_headers` (all matches) for lookup; `replace_header` for server-controlled overrides
+- [x] Date / Server response headers - injected by `send_response` via `set_default_header` (user-supplied values take precedence); `Server` is configurable via `Config.server_name` ("" to opt out)
+- [x] Idle / keep-alive and per-read timeouts - separate `Config.idle_timeout_ms` (next-request wait on keep-alive) and `Config.read_timeout_ms` (mid-request body/chunk reads), both default 30000ms
+
+## Won't do (HTTP/1.1)
+
+- Request pipelining — clients deprecated it (Chrome years ago, Firefox by default). Servers that don't support it just lose pipelined requests; nobody pipelines anymore. Documented as a known limitation rather than fixed.
 
 ## HTTP/1.1 protocol
-- [ ] Date / Server response headers - RFC SHOULD include both. Trivial to add in `encode_buffered_bytes` / `encode_streamed_head`.
-- [ ] Request pipelining - after parsing, leftover bytes in `rest` are discarded, so pipelined clients lose requests. Spec requires support; real-world clients rarely pipeline, but the gap should be a known limitation or fixed by threading the leftover buffer through `handle_connection`'s loop.
-- [ ] Idle / keep-alive timeouts - currently a 30s `Tcp.recv` timeout doubles as the keep-alive idle timeout. Make it a `Config` knob, separate from per-read timeouts.
+
 - [ ] Server-side error observability - introduce a typed effect (e.g. `Server` with `ServerEvent` variants for `ClientDisconnected`, `ParseError`, `AcceptError`) that the consumer handles at `serve` to log/metric/discard. Currently chunked send failures are `dbg`'d inline and parse errors are silent.
 
 ## Future

@@ -8,24 +8,25 @@ import SagaHttp.Http (Chunked)
 import SagaHttp.Tcp
 
 val test_port = 18765
+val idle_test_port = 18766
 
 fun handle : Http.Request -> Http.Response
 handle req =
-  if req.path == "/stream" then
-    Http.stream 200 [("Content-Type", "text/plain")] (fun () -> {
-      write_chunk! (BitString.from_string "alpha")
-      write_chunk! (BitString.from_string "beta")
-    })
-  else if req.path == "/cookies" then
-    Http.Response {
-      status: 200,
-      headers: [
-        ("Content-Type", "text/plain"),
-        ("Set-Cookie", "a=1"),
-        ("Set-Cookie", "b=2"),
-      ],
-      body: Http.Buffered "ok",
-    }
+  if req.path
+    == "/stream" then Http.stream 200 [("Content-Type", "text/plain")] (fun () -> {
+    write_chunk! (BitString.from_string "alpha")
+    write_chunk! (BitString.from_string "beta")
+  })
+  else if req.path
+    == "/cookies" then Response {
+    status: 200,
+    headers: [
+      ("Content-Type", "text/plain"),
+      ("Set-Cookie", "a=1"),
+      ("Set-Cookie", "b=2"),
+    ],
+    body: Http.Buffered "ok",
+  }
   else case req.body {
     Just body -> case BitString.to_string body {
       Ok s -> Http.text 200 $"echo: {s}"
@@ -236,8 +237,7 @@ tests () = {
     })
 
     test "Expect: 100-continue gets interim 100 Continue then final 200" (fun () -> {
-      let req =
-        "POST /echo HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
         <> "hello"
       case request req {
         Ok r -> {
@@ -250,8 +250,7 @@ tests () = {
     })
 
     test "Expect: 100-continue is ignored for HTTP/1.0" (fun () -> {
-      let req =
-        "POST /echo HTTP/1.0\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"
+      let req = "POST /echo HTTP/1.0\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"
         <> "hello"
       case request req {
         Ok r -> {
@@ -266,7 +265,8 @@ tests () = {
     })
 
     test "unsupported Expect value returns 417" (fun () -> {
-      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nExpect: weird\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nExpect: weird\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
       case request req {
         Ok r -> assert_contains "HTTP/1.1 417 Expectation Failed" r
         Err _ -> assert_true False
@@ -292,6 +292,17 @@ tests () = {
       }
     })
 
+    test "responses include Date and Server headers by default" (fun () -> {
+      case request "GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "Date: " r
+          assert_contains " GMT" r
+          assert_contains "Server: saga_http" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
     test "multiple Set-Cookie headers each appear on the wire" (fun () -> {
       case request "GET /cookies HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
         Ok r -> {
@@ -300,6 +311,36 @@ tests () = {
         }
         Err _ -> assert_true False
       }
+    })
+
+    test "idle_timeout_ms closes a quiet keep-alive connection" (fun () -> {
+      let result = {
+        # Start a second server on a different port with a 100ms idle timeout.
+        let _ = spawn! (fun () -> {
+          let cfg = { Http.default_config | port: idle_test_port, idle_timeout_ms: 100 }
+          let _ = Http.serve cfg handle
+          ()
+        })
+        sleep! 100
+
+        case Tcp.connect "127.0.0.1" idle_test_port 5000 {
+          Err _ -> False
+          Ok sock -> {
+            let _ = Tcp.send sock (BitString.from_string "GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            let r1 = Tcp.recv sock 0 5000
+            # Wait past the idle timeout, then the next recv should fail
+            # because the server timed us out and closed the connection.
+            sleep! 300
+            let r2 = Tcp.recv sock 0 1000
+            let _ = Tcp.close sock
+            case (r1, r2) {
+              (Ok _, Err _) -> True
+              _ -> False
+            }
+          }
+        }
+      } with beam_actor
+      assert_true result
     })
 
     test "streamed response uses Transfer-Encoding: chunked" (fun () -> {

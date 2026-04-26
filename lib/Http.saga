@@ -21,6 +21,12 @@ pub fun decode_request_line : (data: BitString) -> (max_size: Int) -> Result (St
 @external("erlang", "SagaHttp.bridge", "decode_header")
 pub fun decode_header : (data: BitString) -> (max_size: Int) -> Result HeaderResult String
 
+# Returns the current UTC time as an IMF-fixdate string suitable for the
+# `Date` response header. NOT pure (it reads the system clock); typed as
+# pure for FFI ergonomics, matching the rest of our bridge surface.
+@external("erlang", "SagaHttp.bridge", "current_http_date")
+pub fun current_http_date : Unit -> String
+
 # -- Types --
 
 pub type HttpVersion = Http1_0 | Http1_1 deriving (Debug, Eq)
@@ -68,6 +74,18 @@ pub record Config {
   max_chunk_line_size: Int,
   # Cap on the trailer-headers section after the final 0-size chunk.
   max_trailer_size: Int,
+  # Sent as the `Server` response header (unless the user already set one).
+  # Set to "" to opt out of identifying the software.
+  server_name: String,
+  # Time to wait for the *next* request on a keep-alive connection before
+  # closing the idle socket. Doesn't apply to the first request — that's
+  # bounded by the client's own connect/send timing.
+  idle_timeout_ms: Int,
+  # Time to wait for individual reads while parsing a single request:
+  # body bytes (Content-Length), chunk-size lines, chunk payloads, and
+  # trailer headers. Should be shorter than idle_timeout_ms in most
+  # deployments; defaulting both to the same value preserves prior behavior.
+  read_timeout_ms: Int,
 }
 
 pub val default_config = Config {
@@ -76,6 +94,9 @@ pub val default_config = Config {
   max_header_size: 8192,
   max_chunk_line_size: 1024,
   max_trailer_size: 8192,
+  server_name: "saga_http",
+  idle_timeout_ms: 30000,
+  read_timeout_ms: 30000,
 }
 
 # -- Header helpers --
@@ -116,6 +137,14 @@ replace_header name value headers = {
     String.to_lower n != target
   }) headers
   List.append kept [(name, value)]
+}
+
+# Append `(name, value)` only if no entry with this name (case-insensitively)
+# already exists. Used for headers we want to default but let the user override.
+pub fun set_default_header : String -> String -> List (String, String) -> List (String, String)
+set_default_header name value headers = case find_header name headers {
+  Just _ -> headers
+  Nothing -> List.append headers [(name, value)]
 }
 
 # -- Response helpers --
@@ -210,22 +239,35 @@ chunked_socket socket = handler for Chunked {
   }
 }
 
+# Adds the server-controlled `Date` and `Server` response headers
+# unless the user already set them. Server is omitted entirely when
+# `config.server_name` is the empty string.
+fun inject_server_headers : Config -> List (String, String) -> List (String, String)
+inject_server_headers config headers = {
+  let with_date = set_default_header "Date" (current_http_date ()) headers
+  if config.server_name == "" then with_date
+  else set_default_header "Server" config.server_name with_date
+}
+
 # Sends a response over the socket, choosing the buffered or chunked
 # wire format based on the body variant.
-pub fun send_response : Tcp.Socket -> String -> Response -> Unit
-send_response socket method resp = case resp.body {
-  Buffered body -> {
-    let _ =
-      Tcp.send socket (encode_buffered_bytes method resp.status resp.headers body)
-    ()
-  }
-  Streamed producer -> {
-    let _ = Tcp.send socket (encode_streamed_head resp.status resp.headers)
-    if method == "HEAD" then ()
-    else {
-      let h = chunked_socket socket
-      let _ = producer () with h
+pub fun send_response : Config -> Tcp.Socket -> String -> Response -> Unit
+send_response config socket method resp = {
+  let headers = inject_server_headers config resp.headers
+  case resp.body {
+    Buffered body -> {
+      let _ =
+        Tcp.send socket (encode_buffered_bytes method resp.status headers body)
       ()
+    }
+    Streamed producer -> {
+      let _ = Tcp.send socket (encode_streamed_head resp.status headers)
+      if method == "HEAD" then ()
+      else {
+        let h = chunked_socket socket
+        let _ = producer () with h
+        ()
+      }
     }
   }
 }
@@ -348,7 +390,7 @@ read_with_content_length config socket rest len_str = case Int.parse len_str {
         <<body:len/binary, _/binary>> -> Ok (Just body)
         _ -> Err BadRequest
       }
-      else case Tcp.recv socket (len - have) 30000 {
+      else case Tcp.recv socket (len - have) config.read_timeout_ms {
         Err _ -> Err BadRequest
         Ok more -> Ok (Just (rest <> more))
       }
@@ -356,8 +398,6 @@ read_with_content_length config socket rest len_str = case Int.parse len_str {
 }
 
 # -- Chunked transfer encoding (request) --
-
-val recv_timeout = 30000
 
 # Locate the first CRLF in `bs`, returning (before, after). O(n^2) but
 # only used on short lines (chunk-size and trailers, both bounded).
@@ -391,46 +431,48 @@ parse_hex_loop bs acc count = case bs {
 # Reads from the socket until `buf` contains a CRLF, returning
 # (line_without_crlf, rest_after_crlf). Bails if the line would exceed
 # `max_size`, to avoid unbounded reads on malicious input.
-fun read_line : Tcp.Socket -> BitString -> Int -> Result (BitString, BitString) ParseError
-read_line socket buf max_size = case find_crlf buf {
+fun read_line : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
+read_line socket buf max_size timeout = case find_crlf buf {
   Just split -> Ok split
   Nothing ->
     if BitString.size buf >= max_size then Err BadRequest
-    else case Tcp.recv socket 0 recv_timeout {
+    else case Tcp.recv socket 0 timeout {
       Err _ -> Err BadRequest
-      Ok more -> read_line socket (buf <> more) max_size
+      Ok more -> read_line socket (buf <> more) max_size timeout
     }
 }
 
 # Ensures `buf` contains at least `n` bytes, returning (first_n, rest).
-fun read_n : Tcp.Socket -> BitString -> Int -> Result (BitString, BitString) ParseError
-read_n socket buf n =
+fun read_n : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
+read_n socket buf n timeout =
   if BitString.size buf >= n then case buf {
     <<first:n/binary, rest/binary>> -> Ok (first, rest)
     _ -> Err BadRequest
   }
-  else case Tcp.recv socket (n - BitString.size buf) recv_timeout {
+  else case Tcp.recv socket (n - BitString.size buf) timeout {
     Err _ -> Err BadRequest
-    Ok more -> read_n socket (buf <> more) n
+    Ok more -> read_n socket (buf <> more) n timeout
   }
 
 # Discards trailer headers up to and including the terminating empty line.
 fun consume_trailers : Config -> Tcp.Socket -> BitString -> Result BitString ParseError
-consume_trailers config socket buf = case read_line socket buf config.max_trailer_size {
-  Err e -> Err e
-  Ok (line, rest) ->
-    if BitString.size line == 0 then Ok rest
-    else consume_trailers config socket rest
-}
+consume_trailers config socket buf =
+  case read_line socket buf config.max_trailer_size config.read_timeout_ms {
+    Err e -> Err e
+    Ok (line, rest) ->
+      if BitString.size line == 0 then Ok rest
+      else consume_trailers config socket rest
+  }
 
 fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError
-read_chunked config socket buf acc = case read_line socket buf config.max_chunk_line_size {
-  Err e -> Err e
-  Ok (line, after_size) -> case parse_chunk_size line {
-    Nothing -> Err BadRequest
-    Just size -> read_chunk_body config socket after_size acc size
+read_chunked config socket buf acc =
+  case read_line socket buf config.max_chunk_line_size config.read_timeout_ms {
+    Err e -> Err e
+    Ok (line, after_size) -> case parse_chunk_size line {
+      Nothing -> Err BadRequest
+      Just size -> read_chunk_body config socket after_size acc size
+    }
   }
-}
 
 fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError
 read_chunk_body config socket buf acc 0 = case consume_trailers config socket buf {
@@ -439,9 +481,9 @@ read_chunk_body config socket buf acc 0 = case consume_trailers config socket bu
 }
 read_chunk_body config socket buf acc size =
   if BitString.size acc + size > config.max_body_size then Err PayloadTooLarge
-  else case read_n socket buf size {
+  else case read_n socket buf size config.read_timeout_ms {
     Err e -> Err e
-    Ok (chunk, after_chunk) -> case read_n socket after_chunk 2 {
+    Ok (chunk, after_chunk) -> case read_n socket after_chunk 2 config.read_timeout_ms {
       Err e -> Err e
       Ok (crlf, rest) -> case crlf {
         <<"\r\n">> -> read_chunked config socket rest (acc <> chunk)
@@ -466,7 +508,7 @@ should_keep_alive req = case find_header "connection" req.headers {
 # or the connection should close.
 pub fun handle_connection : Config -> Tcp.Socket -> (Request -> Response) -> Unit
 handle_connection config socket on_request = {
-  case Tcp.recv socket 0 30000 {
+  case Tcp.recv socket 0 config.idle_timeout_ms {
     Err _ -> Tcp.close socket
     Ok data -> case parse_request config socket data {
       Err err -> {
@@ -475,12 +517,12 @@ handle_connection config socket on_request = {
           PayloadTooLarge -> payload_too_large
           ExpectationFailed -> expectation_failed
         }
-        let _ = send_response socket "GET" resp
+        let _ = send_response config socket "GET" resp
         Tcp.close socket
       }
       Ok req -> {
         let resp = on_request req
-        let _ = send_response socket req.method resp
+        let _ = send_response config socket req.method resp
         if should_keep_alive req then handle_connection config socket on_request
         else Tcp.close socket
       }
