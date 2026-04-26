@@ -1,5 +1,6 @@
 module HttpTest
 
+import Std.BitString
 import Std.Test (
   Testing,
   describe,
@@ -66,20 +67,29 @@ tests () = {
   describe "encode_response" (fun () -> {
     test "GET includes body and Content-Length" (fun () -> {
       let resp = Http.text 200 "hello"
-      let out = Http.encode_response "GET" resp
+      let out = case BitString.to_string (Http.encode_response "GET" resp) {
+        Ok s -> s
+        Err _ -> ""
+      }
       assert_true (String.contains "HTTP/1.1 200 OK" out)
       assert_true (String.contains "Content-Length: 5" out)
       assert_true (String.contains "hello" out)
     })
     test "HEAD omits body but keeps Content-Length" (fun () -> {
       let resp = Http.text 200 "hello"
-      let out = Http.encode_response "HEAD" resp
+      let out = case BitString.to_string (Http.encode_response "HEAD" resp) {
+        Ok s -> s
+        Err _ -> ""
+      }
       assert_true (String.contains "Content-Length: 5" out)
       assert_false (String.contains "hello" out)
     })
     test "GET with empty body still has Content-Length: 0" (fun () -> {
       let resp = Http.text 204 ""
-      let out = Http.encode_response "GET" resp
+      let out = case BitString.to_string (Http.encode_response "GET" resp) {
+        Ok s -> s
+        Err _ -> ""
+      }
       assert_true (String.contains "Content-Length: 0" out)
     })
   })
@@ -107,12 +117,12 @@ tests () = {
 
   describe "decode_headers" (fun () -> {
     test "empty input (just \\r\\n) returns empty dict" (fun () -> {
-      let result = Http.decode_headers (Dict.new ()) "\r\n"
+      let result = Http.decode_headers (Dict.new ()) (BitString.from_string "\r\n")
       assert_ok result
     })
     test "lowercases header names" (fun () -> {
-      let result =
-        Http.decode_headers (Dict.new ()) "Host: example.com\r\nContent-Type: text/plain\r\n\r\n"
+      let input = BitString.from_string "Host: example.com\r\nContent-Type: text/plain\r\n\r\n"
+      let result = Http.decode_headers (Dict.new ()) input
       case result {
         Ok (headers, _) -> {
           assert_eq (Dict.get "host" headers) (Just "example.com")
@@ -122,7 +132,7 @@ tests () = {
       }
     })
     test "malformed header returns Err" (fun () -> {
-      assert_err (Http.decode_headers (Dict.new ()) "NoColonHeader\r\n\r\n")
+      assert_err (Http.decode_headers (Dict.new ()) (BitString.from_string "NoColonHeader\r\n\r\n"))
     })
   })
 

@@ -1,11 +1,15 @@
 module Main
 
 import Std.Actor (beam_actor)
+import Std.BitString
 import SagaHttp.Http (serve, default_config, text, Request, Response)
 
 fun handle : Request -> Response
 handle req = case req.body {
-  Just body -> text 200 $"Got body: {body}"
+  Just body -> case BitString.to_string body {
+    Ok s -> text 200 $"Got body: {s}"
+    Err _ -> text 200 "Got body: <binary>"
+  }
   Nothing -> text 200 $"Hello, you requested {req.path}"
 }
 
