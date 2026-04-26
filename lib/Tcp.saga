@@ -9,6 +9,12 @@ pub fun listen : (port: Int) -> (backlog: Int) -> Result ListenSocket String
 @external("erlang", "SagaHttp.bridge", "accept")
 pub fun accept : (socket: ListenSocket) -> Result Socket String
 
+@external("erlang", "SagaHttp.bridge", "connect")
+pub fun connect : (host: String) -> (port: Int) -> (timeout: Int) -> Result Socket String
+
+@external("erlang", "SagaHttp.bridge", "local_port")
+pub fun local_port : (socket: ListenSocket) -> Result Int String
+
 @external("erlang", "SagaHttp.bridge", "recv")
 pub fun recv : (socket: Socket) -> (length: Int) -> (timeout: Int) -> Result String String
 

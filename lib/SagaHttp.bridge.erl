@@ -2,9 +2,11 @@
 -export([
     listen/2,
     accept/1,
+    connect/3,
     recv/3,
     send/2,
     close/1,
+    local_port/1,
     decode_request_line/1,
     decode_header/1,
     setopts/2,
@@ -28,6 +30,19 @@ listen(Port, Backlog) ->
 accept(ListenSocket) ->
     case gen_tcp:accept(ListenSocket) of
         {ok, Socket} -> {ok, Socket};
+        {error, Reason} -> {error, atom_to_binary(Reason)}
+    end.
+
+connect(Host, Port, Timeout) ->
+    HostStr = binary_to_list(Host),
+    case gen_tcp:connect(HostStr, Port, [binary, {active, false}, {packet, raw}], Timeout) of
+        {ok, Socket} -> {ok, Socket};
+        {error, Reason} -> {error, atom_to_binary(Reason)}
+    end.
+
+local_port(ListenSocket) ->
+    case inet:port(ListenSocket) of
+        {ok, Port} -> {ok, Port};
         {error, Reason} -> {error, atom_to_binary(Reason)}
     end.
 

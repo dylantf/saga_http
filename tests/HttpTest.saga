@@ -1,0 +1,151 @@
+module HttpTest
+
+import Std.Test (
+  Testing,
+  describe,
+  test,
+  assert_eq,
+  assert_true,
+  assert_false,
+  assert_ok,
+  assert_err
+)
+import SagaHttp.Http
+
+fun req_with : Http.HttpVersion -> Dict String String -> Http.Request
+req_with version headers = Request {
+  method: "GET",
+  path: "/",
+  version: version,
+  headers: headers,
+  body: Nothing,
+}
+
+pub fun tests : Unit -> Unit needs {Testing}
+tests () = {
+  describe "parse_version" (fun () -> {
+    test "1.1 -> Http1_1" (fun () -> {
+      assert_eq (Http.parse_version (1, 1)) Http.Http1_1
+    })
+    test "1.0 -> Http1_0" (fun () -> {
+      assert_eq (Http.parse_version (1, 0)) Http.Http1_0
+    })
+    test "0.9 falls back to Http1_0" (fun () -> {
+      assert_eq (Http.parse_version (0, 9)) Http.Http1_0
+    })
+    test "2.0 falls back to Http1_0" (fun () -> {
+      assert_eq (Http.parse_version (2, 0)) Http.Http1_0
+    })
+  })
+
+  describe "status_text" (fun () -> {
+    test "200 -> OK" (fun () -> {
+      assert_eq (Http.status_text 200) "OK"
+    })
+    test "400 -> Bad Request" (fun () -> {
+      assert_eq (Http.status_text 400) "Bad Request"
+    })
+    test "413 -> Payload Too Large" (fun () -> {
+      assert_eq (Http.status_text 413) "Payload Too Large"
+    })
+    test "unknown code -> Unknown" (fun () -> {
+      assert_eq (Http.status_text 999) "Unknown"
+    })
+  })
+
+  describe "encode_headers" (fun () -> {
+    test "empty dict -> empty string" (fun () -> {
+      assert_eq (Http.encode_headers (Dict.new ())) ""
+    })
+    test "single header" (fun () -> {
+      let d = Dict.from_list [("Content-Type", "text/plain")]
+      assert_eq (Http.encode_headers d) "Content-Type: text/plain\r\n"
+    })
+  })
+
+  describe "encode_response" (fun () -> {
+    test "GET includes body and Content-Length" (fun () -> {
+      let resp = Http.text 200 "hello"
+      let out = Http.encode_response "GET" resp
+      assert_true (String.contains "HTTP/1.1 200 OK" out)
+      assert_true (String.contains "Content-Length: 5" out)
+      assert_true (String.contains "hello" out)
+    })
+    test "HEAD omits body but keeps Content-Length" (fun () -> {
+      let resp = Http.text 200 "hello"
+      let out = Http.encode_response "HEAD" resp
+      assert_true (String.contains "Content-Length: 5" out)
+      assert_false (String.contains "hello" out)
+    })
+    test "GET with empty body still has Content-Length: 0" (fun () -> {
+      let resp = Http.text 204 ""
+      let out = Http.encode_response "GET" resp
+      assert_true (String.contains "Content-Length: 0" out)
+    })
+  })
+
+  describe "should_keep_alive" (fun () -> {
+    test "HTTP/1.1, no header -> True" (fun () -> {
+      assert_true (Http.should_keep_alive (req_with Http.Http1_1 (Dict.new ())))
+    })
+    test "HTTP/1.0, no header -> False" (fun () -> {
+      assert_false (Http.should_keep_alive (req_with Http.Http1_0 (Dict.new ())))
+    })
+    test "HTTP/1.1, Connection: close -> False" (fun () -> {
+      let h = Dict.from_list [("connection", "close")]
+      assert_false (Http.should_keep_alive (req_with Http.Http1_1 h))
+    })
+    test "HTTP/1.0, Connection: keep-alive -> True" (fun () -> {
+      let h = Dict.from_list [("connection", "keep-alive")]
+      assert_true (Http.should_keep_alive (req_with Http.Http1_0 h))
+    })
+    test "Unknown Connection value falls back to version default (1.1)" (fun () -> {
+      let h = Dict.from_list [("connection", "weird")]
+      assert_true (Http.should_keep_alive (req_with Http.Http1_1 h))
+    })
+  })
+
+  describe "decode_headers" (fun () -> {
+    test "empty input (just \\r\\n) returns empty dict" (fun () -> {
+      let result = Http.decode_headers (Dict.new ()) "\r\n"
+      assert_ok result
+    })
+    test "lowercases header names" (fun () -> {
+      let result =
+        Http.decode_headers (Dict.new ()) "Host: example.com\r\nContent-Type: text/plain\r\n\r\n"
+      case result {
+        Ok (headers, _) -> {
+          assert_eq (Dict.get "host" headers) (Just "example.com")
+          assert_eq (Dict.get "content-type" headers) (Just "text/plain")
+        }
+        Err _ -> assert_true False
+      }
+    })
+    test "malformed header returns Err" (fun () -> {
+      assert_err (Http.decode_headers (Dict.new ()) "NoColonHeader\r\n\r\n")
+    })
+  })
+
+  describe "text helper" (fun () -> {
+    test "sets Content-Type: text/plain" (fun () -> {
+      let resp = Http.text 200 "hi"
+      assert_eq (Dict.get "Content-Type" resp.headers) (Just "text/plain")
+    })
+    test "sets status and body" (fun () -> {
+      let resp = Http.text 404 "not found"
+      assert_eq resp.status 404
+      assert_eq resp.body "not found"
+    })
+  })
+
+  describe "error responses" (fun () -> {
+    test "bad_request is 400 with Connection: close" (fun () -> {
+      assert_eq Http.bad_request.status 400
+      assert_eq (Dict.get "Connection" Http.bad_request.headers) (Just "close")
+    })
+    test "payload_too_large is 413 with Connection: close" (fun () -> {
+      assert_eq Http.payload_too_large.status 413
+      assert_eq (Dict.get "Connection" Http.payload_too_large.headers) (Just "close")
+    })
+  })
+}

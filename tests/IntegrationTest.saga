@@ -1,0 +1,136 @@
+module IntegrationTest
+
+import Std.Actor (Process, Timer, beam_actor)
+import Std.Test (Testing, Test, describe, test, assert_true)
+import SagaHttp.Http
+import SagaHttp.Tcp
+
+val test_port = 18765
+
+fun handle : Http.Request -> Http.Response
+handle req = case req.body {
+  Just body -> Http.text 200 $"echo: {body}"
+  Nothing -> Http.text 200 $"path: {req.path}"
+}
+
+# Send raw bytes on a fresh connection, return the response.
+fun request : String -> Result String String
+request raw = case Tcp.connect "127.0.0.1" test_port 5000 {
+  Err e -> Err e
+  Ok sock -> {
+    let _ = Tcp.send sock raw
+    let r = Tcp.recv sock 0 5000
+    let _ = Tcp.close sock
+    r
+  }
+}
+
+# Send two requests on a single connection, returning each response separately.
+fun two_requests : String -> String -> Result (String, Result String String) String
+two_requests first second = case Tcp.connect "127.0.0.1" test_port 5000 {
+  Err e -> Err e
+  Ok sock -> {
+    let _ = Tcp.send sock first
+    let r1 = Tcp.recv sock 0 5000
+    case r1 {
+      Err e -> {
+        let _ = Tcp.close sock
+        Err e
+      }
+      Ok resp1 -> {
+        let _ = Tcp.send sock second
+        let r2 = Tcp.recv sock 0 5000
+        let _ = Tcp.close sock
+        Ok (resp1, r2)
+      }
+    }
+  }
+}
+
+fun assert_contains : String -> String -> Unit needs {Test}
+assert_contains needle haystack =
+  if String.contains needle haystack then assert! True ""
+  else assert! False $"expected to contain {needle}, got: {haystack}"
+
+pub fun tests : Unit -> Unit needs {Testing}
+tests () = {
+  describe "integration" (fun () -> {
+    let _ = {
+      let _ = spawn! (fun () -> {
+        let _ = Http.serve ({ Http.default_config | port: test_port }) handle
+        ()
+      })
+      sleep! 200
+    } with beam_actor
+
+    test "GET returns 200 with body" (fun () -> {
+      case request "GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "path: /test" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "POST echoes body" (fun () -> {
+      case request "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "echo: hello" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "HEAD returns headers without body" (fun () -> {
+      case request "HEAD /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "Content-Length: 11" r
+          # body 'path: /test' is 11 bytes, but should not appear
+          if String.contains "path: /test" r then assert_true False
+          else assert_true True
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "garbled request returns 400" (fun () -> {
+      case request "NOT_HTTP\r\n\r\n" {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "oversized Content-Length returns 413" (fun () -> {
+      case request "POST /huge HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999999\r\n\r\n" {
+        Ok r -> assert_contains "HTTP/1.1 413 Payload Too Large" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "HTTP/1.1 keep-alive: two requests on one connection" (fun () -> {
+      let req1 = "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n"
+      let req2 =
+        "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+      case two_requests req1 req2 {
+        Ok (resp1, Ok resp2) -> {
+          assert_contains "path: /a" resp1
+          assert_contains "path: /b" resp2
+        }
+        _ -> assert_true False
+      }
+    })
+
+    test "HTTP/1.0 default closes after one request" (fun () -> {
+      let req1 = "GET /a HTTP/1.0\r\n\r\n"
+      let req2 = "GET /b HTTP/1.0\r\n\r\n"
+      case two_requests req1 req2 {
+        # First response succeeds, second recv fails because server closed
+        Ok (resp1, Err _) -> assert_contains "path: /a" resp1
+        _ -> assert_true False
+      }
+    })
+  })
+}

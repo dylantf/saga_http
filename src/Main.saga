@@ -1,7 +1,7 @@
 module Main
 
 import Std.Actor (beam_actor)
-import SagaHttp.Http (serve, text, Request, Response)
+import SagaHttp.Http (serve, default_config, text, Request, Response)
 
 fun handle : Request -> Response
 handle req = case req.body {
@@ -10,5 +10,5 @@ handle req = case req.body {
 }
 
 main () = {
-  serve 8080 handle
+  serve default_config handle
 } with beam_actor
