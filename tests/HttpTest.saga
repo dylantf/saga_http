@@ -14,7 +14,7 @@ import Std.Test (
 import SagaHttp.Http
 import SagaHttp.Http (Chunked)
 
-fun req_with : Http.HttpVersion -> Dict String String -> Http.Request
+fun req_with : Http.HttpVersion -> List (String, String) -> Http.Request
 req_with version headers = Request {
   method: "GET",
   path: "/",
@@ -57,10 +57,10 @@ tests () = {
 
   describe "encode_headers" (fun () -> {
     test "empty dict -> empty string" (fun () -> {
-      assert_eq (Http.encode_headers (Dict.new ())) ""
+      assert_eq (Http.encode_headers []) ""
     })
     test "single header" (fun () -> {
-      let d = Dict.from_list [("Content-Type", "text/plain")]
+      let d = [("Content-Type", "text/plain")]
       assert_eq (Http.encode_headers d) "Content-Type: text/plain\r\n"
     })
   })
@@ -97,50 +97,50 @@ tests () = {
 
   describe "should_keep_alive" (fun () -> {
     test "HTTP/1.1, no header -> True" (fun () -> {
-      assert_true (Http.should_keep_alive (req_with Http.Http1_1 (Dict.new ())))
+      assert_true (Http.should_keep_alive (req_with Http.Http1_1 []))
     })
     test "HTTP/1.0, no header -> False" (fun () -> {
-      assert_false (Http.should_keep_alive (req_with Http.Http1_0 (Dict.new ())))
+      assert_false (Http.should_keep_alive (req_with Http.Http1_0 []))
     })
     test "HTTP/1.1, Connection: close -> False" (fun () -> {
-      let h = Dict.from_list [("connection", "close")]
+      let h = [("connection", "close")]
       assert_false (Http.should_keep_alive (req_with Http.Http1_1 h))
     })
     test "HTTP/1.0, Connection: keep-alive -> True" (fun () -> {
-      let h = Dict.from_list [("connection", "keep-alive")]
+      let h = [("connection", "keep-alive")]
       assert_true (Http.should_keep_alive (req_with Http.Http1_0 h))
     })
     test "Unknown Connection value falls back to version default (1.1)" (fun () -> {
-      let h = Dict.from_list [("connection", "weird")]
+      let h = [("connection", "weird")]
       assert_true (Http.should_keep_alive (req_with Http.Http1_1 h))
     })
   })
 
   describe "decode_headers" (fun () -> {
     test "empty input (just \\r\\n) returns empty dict" (fun () -> {
-      let result = Http.decode_headers Http.default_config (Dict.new ()) (BitString.from_string "\r\n")
+      let result = Http.decode_headers Http.default_config [] (BitString.from_string "\r\n")
       assert_ok result
     })
     test "lowercases header names" (fun () -> {
       let input = BitString.from_string "Host: example.com\r\nContent-Type: text/plain\r\n\r\n"
-      let result = Http.decode_headers Http.default_config (Dict.new ()) input
+      let result = Http.decode_headers Http.default_config [] input
       case result {
         Ok (headers, _) -> {
-          assert_eq (Dict.get "host" headers) (Just "example.com")
-          assert_eq (Dict.get "content-type" headers) (Just "text/plain")
+          assert_eq (Http.find_header "host" headers) (Just "example.com")
+          assert_eq (Http.find_header "content-type" headers) (Just "text/plain")
         }
         Err _ -> assert_true False
       }
     })
     test "malformed header returns Err" (fun () -> {
-      assert_err (Http.decode_headers Http.default_config (Dict.new ()) (BitString.from_string "NoColonHeader\r\n\r\n"))
+      assert_err (Http.decode_headers Http.default_config [] (BitString.from_string "NoColonHeader\r\n\r\n"))
     })
   })
 
   describe "text helper" (fun () -> {
     test "sets Content-Type: text/plain" (fun () -> {
       let resp = Http.text 200 "hi"
-      assert_eq (Dict.get "Content-Type" resp.headers) (Just "text/plain")
+      assert_eq (Http.find_header "content-type" resp.headers) (Just "text/plain")
     })
     test "sets status and body" (fun () -> {
       let resp = Http.text 404 "not found"
@@ -155,17 +155,42 @@ tests () = {
   describe "error responses" (fun () -> {
     test "bad_request is 400 with Connection: close" (fun () -> {
       assert_eq Http.bad_request.status 400
-      assert_eq (Dict.get "Connection" Http.bad_request.headers) (Just "close")
+      assert_eq (Http.find_header "connection" Http.bad_request.headers) (Just "close")
     })
     test "payload_too_large is 413 with Connection: close" (fun () -> {
       assert_eq Http.payload_too_large.status 413
-      assert_eq (Dict.get "Connection" Http.payload_too_large.headers) (Just "close")
+      assert_eq (Http.find_header "connection" Http.payload_too_large.headers) (Just "close")
+    })
+  })
+
+  describe "header helpers" (fun () -> {
+    test "find_header is case-insensitive" (fun () -> {
+      let h = [("Content-Type", "text/plain")]
+      assert_eq (Http.find_header "content-type" h) (Just "text/plain")
+      assert_eq (Http.find_header "CONTENT-TYPE" h) (Just "text/plain")
+    })
+    test "find_header returns Nothing when missing" (fun () -> {
+      assert_eq (Http.find_header "x-missing" []) Nothing
+    })
+    test "find_header returns the first match" (fun () -> {
+      let h = [("X-Trace", "first"), ("X-Trace", "second")]
+      assert_eq (Http.find_header "x-trace" h) (Just "first")
+    })
+    test "find_all_headers returns every match in order" (fun () -> {
+      let h = [("Set-Cookie", "a=1"), ("Content-Type", "text/plain"), ("set-cookie", "b=2")]
+      assert_eq (Http.find_all_headers "set-cookie" h) ["a=1", "b=2"]
+    })
+    test "replace_header drops existing entries case-insensitively" (fun () -> {
+      let h = [("content-length", "0"), ("Content-Type", "text/plain")]
+      let h2 = Http.replace_header "Content-Length" "5" h
+      assert_eq (Http.find_header "content-length" h2) (Just "5")
+      assert_eq (List.length (Http.find_all_headers "content-length" h2)) 1
     })
   })
 
   describe "stream constructor" (fun () -> {
     test "produces a Streamed body" (fun () -> {
-      let resp = Http.stream 200 (Dict.new ()) (fun () -> ())
+      let resp = Http.stream 200 [] (fun () -> ())
       case resp.body {
         Http.Streamed _ -> assert_true True
         _ -> assert_true False
@@ -173,7 +198,7 @@ tests () = {
     })
 
     test "collect handler captures every chunk" (fun () -> {
-      let resp = Http.stream 200 (Dict.new ()) (fun () -> {
+      let resp = Http.stream 200 [] (fun () -> {
         write_chunk! (BitString.from_string "first")
         write_chunk! (BitString.from_string "second")
       })
@@ -193,7 +218,7 @@ tests () = {
     })
 
     test "concat handler joins all chunks" (fun () -> {
-      let resp = Http.stream 200 (Dict.new ()) (fun () -> {
+      let resp = Http.stream 200 [] (fun () -> {
         write_chunk! (BitString.from_string "hello ")
         write_chunk! (BitString.from_string "world")
       })

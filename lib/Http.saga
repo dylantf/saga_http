@@ -29,7 +29,10 @@ pub record Request {
   method: String,
   path: String,
   version: HttpVersion,
-  headers: Dict String String,
+  # Header names are lowercased on the request side for case-insensitive
+  # matching (HTTP header names are case-insensitive per RFC 9110).
+  # Order is preserved as it appeared on the wire.
+  headers: List (String, String),
   body: Maybe BitString,
 }
 
@@ -43,7 +46,10 @@ pub type ResponseBody =
 
 pub record Response {
   status: Int,
-  headers: Dict String String,
+  # User-provided case is preserved on the wire. Multiple entries with
+  # the same name are sent as separate header lines (required for
+  # `Set-Cookie`; allowed for any header per RFC 7230 §3.2.2).
+  headers: List (String, String),
   body: ResponseBody,
 }
 
@@ -72,16 +78,56 @@ pub val default_config = Config {
   max_trailer_size: 8192,
 }
 
+# -- Header helpers --
+
+# First value matching `name`, case-insensitive. Returns Nothing if
+# the header isn't present. Use `find_all_headers` when a header may
+# legitimately appear more than once (e.g. `Set-Cookie`).
+pub fun find_header : String -> List (String, String) -> Maybe String
+find_header name headers = find_header_loop (String.to_lower name) headers
+
+fun find_header_loop : String -> List (String, String) -> Maybe String
+find_header_loop _ [] = Nothing
+find_header_loop target ((n, v) :: rest) =
+  if String.to_lower n == target then Just v
+  else find_header_loop target rest
+
+# All values matching `name`, in the order they appear. Useful for
+# headers that may legitimately repeat (`Set-Cookie`, `Cache-Control`,
+# `Vary`, etc.).
+pub fun find_all_headers : String -> List (String, String) -> List String
+find_all_headers name headers = {
+  let target = String.to_lower name
+  List.filter_map (fun pair -> {
+    let (n, v) = pair
+    if String.to_lower n == target then Just v
+    else Nothing
+  }) headers
+}
+
+# Replace any existing entries with this name (case-insensitively),
+# appending the new entry at the end. Used by encoders to set
+# server-controlled headers like Content-Length.
+pub fun replace_header : String -> String -> List (String, String) -> List (String, String)
+replace_header name value headers = {
+  let target = String.to_lower name
+  let kept = List.filter (fun pair -> {
+    let (n, _) = pair
+    String.to_lower n != target
+  }) headers
+  List.append kept [(name, value)]
+}
+
 # -- Response helpers --
 
 pub fun text : Int -> String -> Response
 text status body = Response {
   status: status,
-  headers: Dict.from_list [("Content-Type", "text/plain")],
+  headers: [("Content-Type", "text/plain")],
   body: Buffered body,
 }
 
-pub fun stream : Int -> Dict String String -> (Unit -> Unit needs {Chunked}) -> Response
+pub fun stream : Int -> List (String, String) -> (Unit -> Unit needs {Chunked}) -> Response
 stream status headers producer = Response {
   status: status,
   headers: headers,
@@ -102,9 +148,9 @@ status_text code = case code {
   _ -> "Unknown"
 }
 
-pub fun encode_headers : Dict String String -> String
+pub fun encode_headers : List (String, String) -> String
 encode_headers headers =
-  Dict.to_list headers
+  headers
   |> List.foldl (fun acc entry -> {
     let (key, value) = entry
     acc <> key <> ": " <> value <> "\r\n"
@@ -119,10 +165,10 @@ encode_response method resp = case resp.body {
     panic "encode_response: cannot encode a Streamed response, use send_response"
 }
 
-fun encode_buffered_bytes : String -> Int -> Dict String String -> String -> BitString
+fun encode_buffered_bytes : String -> Int -> List (String, String) -> String -> BitString
 encode_buffered_bytes method status headers body = {
   let body_len = show (String.byte_size body)
-  let headers = Dict.put "Content-Length" body_len headers
+  let headers = replace_header "Content-Length" body_len headers
   let head = $"HTTP/1.1 {show status} {status_text status}\r\n"
     <> encode_headers headers
     <> "\r\n"
@@ -131,9 +177,9 @@ encode_buffered_bytes method status headers body = {
   else head_bits <> BitString.from_string body
 }
 
-fun encode_streamed_head : Int -> Dict String String -> BitString
+fun encode_streamed_head : Int -> List (String, String) -> BitString
 encode_streamed_head status headers = {
-  let headers = Dict.put "Transfer-Encoding" "chunked" headers
+  let headers = replace_header "Transfer-Encoding" "chunked" headers
   BitString.from_string ($"HTTP/1.1 {show status} {status_text status}\r\n"
     <> encode_headers headers
     <> "\r\n")
@@ -186,7 +232,7 @@ send_response socket method resp = case resp.body {
 
 pub val bad_request = Response {
   status: 400,
-  headers: Dict.from_list [
+  headers: [
     ("Content-Type", "text/plain"),
     ("Connection", "close"),
   ],
@@ -195,7 +241,7 @@ pub val bad_request = Response {
 
 pub val payload_too_large = Response {
   status: 413,
-  headers: Dict.from_list [
+  headers: [
     ("Content-Type", "text/plain"),
     ("Connection", "close"),
   ],
@@ -204,7 +250,7 @@ pub val payload_too_large = Response {
 
 pub val expectation_failed = Response {
   status: 417,
-  headers: Dict.from_list [
+  headers: [
     ("Content-Type", "text/plain"),
     ("Connection", "close"),
   ],
@@ -222,7 +268,7 @@ parse_version v = case v {
 pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result Request ParseError
 parse_request config socket input = do {
   Ok (method, path, version_tuple, rest) <- decode_request_line input config.max_header_size
-  Ok (headers, rest) <- decode_headers config (Dict.new ()) rest
+  Ok (headers, rest) <- decode_headers config [] rest
   Ok _ <- maybe_send_continue socket (parse_version version_tuple) headers
   Ok body <- read_body config socket headers rest
   Ok (Request {
@@ -242,8 +288,8 @@ parse_request config socket input = do {
 # the server replies with `100 Continue` to signal it's willing to read the
 # body. Any other Expect value is rejected with 417. HTTP/1.0 clients don't
 # understand 100 Continue, so we ignore the header for them.
-fun maybe_send_continue : Tcp.Socket -> HttpVersion -> Dict String String -> Result Unit ParseError
-maybe_send_continue socket version headers = case Dict.get "expect" headers {
+fun maybe_send_continue : Tcp.Socket -> HttpVersion -> List (String, String) -> Result Unit ParseError
+maybe_send_continue socket version headers = case find_header "expect" headers {
   Nothing -> Ok ()
   Just v ->
     if String.to_lower v != "100-continue" then Err ExpectationFailed
@@ -256,21 +302,23 @@ maybe_send_continue socket version headers = case Dict.get "expect" headers {
     }
 }
 
-pub fun decode_headers : Config -> Dict String String -> BitString -> Result (Dict String String, BitString) ParseError
-decode_headers config headers input = case decode_header input config.max_header_size {
+# Builds the headers list in reverse to keep insertion O(1), then reverses
+# at the end so the wire-order is preserved for the user.
+pub fun decode_headers : Config -> List (String, String) -> BitString -> Result (List (String, String), BitString) ParseError
+decode_headers config acc input = case decode_header input config.max_header_size {
   Ok (Header key value rest) ->
-    decode_headers config (Dict.put (String.to_lower key) value headers) rest
-  Ok (Done rest) -> Ok (headers, rest)
+    decode_headers config ((String.to_lower key, value) :: acc) rest
+  Ok (Done rest) -> Ok (List.reverse acc, rest)
   Err _ -> Err BadRequest
 }
 
-pub fun read_body : Config -> Tcp.Socket -> Dict String String -> BitString -> Result (Maybe BitString) ParseError
+pub fun read_body : Config -> Tcp.Socket -> List (String, String) -> BitString -> Result (Maybe BitString) ParseError
 read_body config socket headers rest = {
-  let te = case Dict.get "transfer-encoding" headers {
+  let te = case find_header "transfer-encoding" headers {
     Just v -> Just (String.to_lower v)
     Nothing -> Nothing
   }
-  let cl = Dict.get "content-length" headers
+  let cl = find_header "content-length" headers
   case te {
     Just te_val ->
       if te_val != "chunked" then Err BadRequest
@@ -405,7 +453,7 @@ read_chunk_body config socket buf acc size =
 # -- Server --
 
 pub fun should_keep_alive : Request -> Bool
-should_keep_alive req = case Dict.get "connection" req.headers {
+should_keep_alive req = case find_header "connection" req.headers {
   Just "close" -> False
   Just "keep-alive" -> True
   _ -> case req.version {

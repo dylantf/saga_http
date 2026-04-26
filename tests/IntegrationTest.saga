@@ -11,11 +11,21 @@ val test_port = 18765
 
 fun handle : Http.Request -> Http.Response
 handle req =
-  if req.path
-    == "/stream" then Http.stream 200 (Dict.from_list [("Content-Type", "text/plain")]) (fun () -> {
-    write_chunk! (BitString.from_string "alpha")
-    write_chunk! (BitString.from_string "beta")
-  })
+  if req.path == "/stream" then
+    Http.stream 200 [("Content-Type", "text/plain")] (fun () -> {
+      write_chunk! (BitString.from_string "alpha")
+      write_chunk! (BitString.from_string "beta")
+    })
+  else if req.path == "/cookies" then
+    Http.Response {
+      status: 200,
+      headers: [
+        ("Content-Type", "text/plain"),
+        ("Set-Cookie", "a=1"),
+        ("Set-Cookie", "b=2"),
+      ],
+      body: Http.Buffered "ok",
+    }
   else case req.body {
     Just body -> case BitString.to_string body {
       Ok s -> Http.text 200 $"echo: {s}"
@@ -278,6 +288,16 @@ tests () = {
       let req = $"GET / HTTP/1.1\r\nHost: localhost\r\nX-Big: {big}\r\n\r\n"
       case request req {
         Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "multiple Set-Cookie headers each appear on the wire" (fun () -> {
+      case request "GET /cookies HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "Set-Cookie: a=1" r
+          assert_contains "Set-Cookie: b=2" r
+        }
         Err _ -> assert_true False
       }
     })
