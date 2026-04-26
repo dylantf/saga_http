@@ -225,6 +225,44 @@ tests () = {
       }
     })
 
+    test "Expect: 100-continue gets interim 100 Continue then final 200" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+        <> "hello"
+      case request req {
+        Ok r -> {
+          assert_contains "HTTP/1.1 100 Continue" r
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "echo: hello" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "Expect: 100-continue is ignored for HTTP/1.0" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.0\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"
+        <> "hello"
+      case request req {
+        Ok r -> {
+          # No interim response — straight to 200
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "echo: hello" r
+          if String.contains "100 Continue" r then assert_true False
+          else assert_true True
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "unsupported Expect value returns 417" (fun () -> {
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nExpect: weird\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 417 Expectation Failed" r
+        Err _ -> assert_true False
+      }
+    })
+
     test "oversized request line returns 400" (fun () -> {
       # Path of 9000 bytes pushes the request line past the 8KB default.
       let big_path = String.repeat 9000 "a"

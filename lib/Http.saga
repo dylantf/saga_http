@@ -47,7 +47,8 @@ pub record Response {
   body: ResponseBody,
 }
 
-pub type ParseError = BadRequest | PayloadTooLarge deriving (Debug, Eq)
+pub type ParseError = BadRequest | PayloadTooLarge | ExpectationFailed
+  deriving (Debug, Eq)
 
 pub record Config {
   port: Int,
@@ -89,12 +90,14 @@ stream status headers producer = Response {
 
 pub fun status_text : Int -> String
 status_text code = case code {
+  100 -> "Continue"
   200 -> "OK"
   201 -> "Created"
   204 -> "No Content"
   400 -> "Bad Request"
   404 -> "Not Found"
   413 -> "Payload Too Large"
+  417 -> "Expectation Failed"
   500 -> "Internal Server Error"
   _ -> "Unknown"
 }
@@ -181,8 +184,7 @@ send_response socket method resp = case resp.body {
   }
 }
 
-pub fun bad_request : Response
-bad_request = Response {
+pub val bad_request = Response {
   status: 400,
   headers: Dict.from_list [
     ("Content-Type", "text/plain"),
@@ -191,14 +193,22 @@ bad_request = Response {
   body: Buffered "Bad Request",
 }
 
-pub fun payload_too_large : Response
-payload_too_large = Response {
+pub val payload_too_large = Response {
   status: 413,
   headers: Dict.from_list [
     ("Content-Type", "text/plain"),
     ("Connection", "close"),
   ],
   body: Buffered "Payload Too Large",
+}
+
+pub val expectation_failed = Response {
+  status: 417,
+  headers: Dict.from_list [
+    ("Content-Type", "text/plain"),
+    ("Connection", "close"),
+  ],
+  body: Buffered "Expectation Failed",
 }
 
 # -- Request parsing --
@@ -211,19 +221,39 @@ parse_version v = case v {
 
 pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result Request ParseError
 parse_request config socket input = do {
-  Ok (method, path, version, rest) <- decode_request_line input config.max_header_size
+  Ok (method, path, version_tuple, rest) <- decode_request_line input config.max_header_size
   Ok (headers, rest) <- decode_headers config (Dict.new ()) rest
+  Ok _ <- maybe_send_continue socket (parse_version version_tuple) headers
   Ok body <- read_body config socket headers rest
   Ok (Request {
     method: method,
     path: path,
-    version: parse_version version,
+    version: parse_version version_tuple,
     headers: headers,
     body: body,
   })
 } else {
   Err PayloadTooLarge -> Err PayloadTooLarge
+  Err ExpectationFailed -> Err ExpectationFailed
   _ -> Err BadRequest
+}
+
+# Per RFC 7231 §5.1.1: when an HTTP/1.1 client sends `Expect: 100-continue`,
+# the server replies with `100 Continue` to signal it's willing to read the
+# body. Any other Expect value is rejected with 417. HTTP/1.0 clients don't
+# understand 100 Continue, so we ignore the header for them.
+fun maybe_send_continue : Tcp.Socket -> HttpVersion -> Dict String String -> Result Unit ParseError
+maybe_send_continue socket version headers = case Dict.get "expect" headers {
+  Nothing -> Ok ()
+  Just v ->
+    if String.to_lower v != "100-continue" then Err ExpectationFailed
+    else case version {
+      Http1_1 -> {
+        let _ = Tcp.send socket (BitString.from_string "HTTP/1.1 100 Continue\r\n\r\n")
+        Ok ()
+      }
+      Http1_0 -> Ok ()
+    }
 }
 
 pub fun decode_headers : Config -> Dict String String -> BitString -> Result (Dict String String, BitString) ParseError
@@ -395,6 +425,7 @@ handle_connection config socket on_request = {
         let resp = case err {
           BadRequest -> bad_request
           PayloadTooLarge -> payload_too_large
+          ExpectationFailed -> expectation_failed
         }
         let _ = send_response socket "GET" resp
         Tcp.close socket
