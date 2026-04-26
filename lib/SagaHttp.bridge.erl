@@ -58,6 +58,8 @@ decode_request_line(Data) ->
                     true -> iolist_to_binary(io_lib:format("~p", [Method]))
                 end,
             {ok, {MethodBin, Path, {Major, Minor}, Rest}};
+        {ok, {http_error, _Line}, _Rest} ->
+            {error, <<"parse_error">>};
         {more, _} ->
             {error, <<"incomplete">>};
         {error, _Reason} ->
@@ -77,6 +79,8 @@ decode_header(Data) ->
             {ok, {sagahttp_http_Header, NameBin, Value, Rest}};
         {ok, http_eoh, Rest} ->
             {ok, {sagahttp_http_Done, Rest}};
+        {ok, {http_error, _Line}, _Rest} ->
+            {error, <<"parse_error">>};
         {more, _} ->
             {error, <<"incomplete">>};
         {error, _Reason} ->

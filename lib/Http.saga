@@ -138,7 +138,10 @@ handle_connection socket on_request = {
   case Tcp.recv socket 0 30000 {
     Err _ -> Tcp.close socket
     Ok data -> case parse_request socket data {
-      Err _ -> Tcp.close socket
+      Err _ -> {
+        let _ = Tcp.send socket (encode_response bad_request)
+        Tcp.close socket
+      }
       Ok req -> {
         let resp = on_request req
         let _ = Tcp.send socket (encode_response resp)
@@ -147,6 +150,16 @@ handle_connection socket on_request = {
       }
     }
   }
+}
+
+fun bad_request : Response
+bad_request = Response {
+  status: 400,
+  headers: Dict.from_list [
+    ("Content-Type", "text/plain"),
+    ("Connection", "close"),
+  ],
+  body: "Bad Request",
 }
 
 fun accept_loop : Tcp.ListenSocket -> (Request -> Response) -> Unit
