@@ -11,11 +11,11 @@ val test_port = 18765
 
 fun handle : Http.Request -> Http.Response
 handle req =
-  if req.path == "/stream" then
-    Http.stream 200 (Dict.from_list [("Content-Type", "text/plain")]) (fun () -> {
-      write_chunk! (BitString.from_string "alpha")
-      write_chunk! (BitString.from_string "beta")
-    })
+  if req.path
+    == "/stream" then Http.stream 200 (Dict.from_list [("Content-Type", "text/plain")]) (fun () -> {
+    write_chunk! (BitString.from_string "alpha")
+    write_chunk! (BitString.from_string "beta")
+  })
   else case req.body {
     Just body -> case BitString.to_string body {
       Ok s -> Http.text 200 $"echo: {s}"
@@ -169,8 +169,7 @@ tests () = {
     })
 
     test "chunked request body, single chunk" (fun () -> {
-      let req =
-        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         <> "5\r\nhello\r\n0\r\n\r\n"
       case request req {
         Ok r -> {
@@ -182,8 +181,7 @@ tests () = {
     })
 
     test "chunked request body, multiple chunks" (fun () -> {
-      let req =
-        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         <> "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
       case request req {
         Ok r -> assert_contains "echo: hello world" r
@@ -192,8 +190,7 @@ tests () = {
     })
 
     test "chunked request honors chunk extensions" (fun () -> {
-      let req =
-        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         <> "5;name=value\r\nhello\r\n0\r\n\r\n"
       case request req {
         Ok r -> assert_contains "echo: hello" r
@@ -202,8 +199,7 @@ tests () = {
     })
 
     test "chunked request with trailers (ignored)" (fun () -> {
-      let req =
-        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         <> "5\r\nhello\r\n0\r\nX-Trailer: ok\r\n\r\n"
       case request req {
         Ok r -> assert_contains "echo: hello" r
@@ -212,8 +208,7 @@ tests () = {
     })
 
     test "Transfer-Encoding + Content-Length together returns 400" (fun () -> {
-      let req =
-        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
         <> "5\r\nhello\r\n0\r\n\r\n"
       case request req {
         Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
@@ -224,6 +219,25 @@ tests () = {
     test "unsupported Transfer-Encoding returns 400" (fun () -> {
       let req =
         "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\nbody"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "oversized request line returns 400" (fun () -> {
+      # Path of 9000 bytes pushes the request line past the 8KB default.
+      let big_path = String.repeat 9000 "a"
+      let req = $"GET /{big_path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "oversized header line returns 400" (fun () -> {
+      let big = String.repeat 9000 "x"
+      let req = $"GET / HTTP/1.1\r\nHost: localhost\r\nX-Big: {big}\r\n\r\n"
       case request req {
         Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
         Err _ -> assert_true False

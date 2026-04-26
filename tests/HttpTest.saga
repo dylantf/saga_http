@@ -118,12 +118,12 @@ tests () = {
 
   describe "decode_headers" (fun () -> {
     test "empty input (just \\r\\n) returns empty dict" (fun () -> {
-      let result = Http.decode_headers (Dict.new ()) (BitString.from_string "\r\n")
+      let result = Http.decode_headers Http.default_config (Dict.new ()) (BitString.from_string "\r\n")
       assert_ok result
     })
     test "lowercases header names" (fun () -> {
       let input = BitString.from_string "Host: example.com\r\nContent-Type: text/plain\r\n\r\n"
-      let result = Http.decode_headers (Dict.new ()) input
+      let result = Http.decode_headers Http.default_config (Dict.new ()) input
       case result {
         Ok (headers, _) -> {
           assert_eq (Dict.get "host" headers) (Just "example.com")
@@ -133,7 +133,7 @@ tests () = {
       }
     })
     test "malformed header returns Err" (fun () -> {
-      assert_err (Http.decode_headers (Dict.new ()) (BitString.from_string "NoColonHeader\r\n\r\n"))
+      assert_err (Http.decode_headers Http.default_config (Dict.new ()) (BitString.from_string "NoColonHeader\r\n\r\n"))
     })
   })
 

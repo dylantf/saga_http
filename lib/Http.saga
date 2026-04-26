@@ -16,10 +16,10 @@ pub type HeaderResult =
   | Done BitString
 
 @external("erlang", "SagaHttp.bridge", "decode_request_line")
-pub fun decode_request_line : (data: BitString) -> Result (String, String, (Int, Int), BitString) String
+pub fun decode_request_line : (data: BitString) -> (max_size: Int) -> Result (String, String, (Int, Int), BitString) String
 
 @external("erlang", "SagaHttp.bridge", "decode_header")
-pub fun decode_header : (data: BitString) -> Result HeaderResult String
+pub fun decode_header : (data: BitString) -> (max_size: Int) -> Result HeaderResult String
 
 # -- Types --
 
@@ -52,9 +52,24 @@ pub type ParseError = BadRequest | PayloadTooLarge deriving (Debug, Eq)
 pub record Config {
   port: Int,
   max_body_size: Int,
+  # Per-line cap on the request line and each header line. Lines that
+  # exceed this come back as a parse error from decode_packet → 400.
+  max_header_size: Int,
+  # Cap on a chunked-transfer-encoding chunk-size line (typically a few
+  # hex digits plus optional extensions). Defends against malicious inputs
+  # that never emit CRLF.
+  max_chunk_line_size: Int,
+  # Cap on the trailer-headers section after the final 0-size chunk.
+  max_trailer_size: Int,
 }
 
-pub val default_config = Config { port: 8080, max_body_size: 1048576 }
+pub val default_config = Config {
+  port: 8080,
+  max_body_size: 1048576,
+  max_header_size: 8192,
+  max_chunk_line_size: 1024,
+  max_trailer_size: 8192,
+}
 
 # -- Response helpers --
 
@@ -136,10 +151,7 @@ chunked_socket socket = handler for Chunked {
         # point trying to send the terminator on a dead socket).
         # TODO: route this through a server-side observability effect
         # once we have one (see docs/planning/http1.md).
-        Err e -> {
-          let _ = dbg ("chunked send failed: ", e)
-          ()
-        }
+        Err e -> dbg ("chunked send failed: ", e)
       }
     }
   }
@@ -199,8 +211,8 @@ parse_version v = case v {
 
 pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result Request ParseError
 parse_request config socket input = do {
-  Ok (method, path, version, rest) <- decode_request_line input
-  Ok (headers, rest) <- decode_headers (Dict.new ()) rest
+  Ok (method, path, version, rest) <- decode_request_line input config.max_header_size
+  Ok (headers, rest) <- decode_headers config (Dict.new ()) rest
   Ok body <- read_body config socket headers rest
   Ok (Request {
     method: method,
@@ -214,10 +226,10 @@ parse_request config socket input = do {
   _ -> Err BadRequest
 }
 
-pub fun decode_headers : Dict String String -> BitString -> Result (Dict String String, BitString) ParseError
-decode_headers headers input = case decode_header input {
+pub fun decode_headers : Config -> Dict String String -> BitString -> Result (Dict String String, BitString) ParseError
+decode_headers config headers input = case decode_header input config.max_header_size {
   Ok (Header key value rest) ->
-    decode_headers (Dict.put (String.to_lower key) value headers) rest
+    decode_headers config (Dict.put (String.to_lower key) value headers) rest
   Ok (Done rest) -> Ok (headers, rest)
   Err _ -> Err BadRequest
 }
@@ -267,8 +279,6 @@ read_with_content_length config socket rest len_str = case Int.parse len_str {
 
 # -- Chunked transfer encoding (request) --
 
-val max_chunk_line_size = 1024
-val max_trailer_size = 8192
 val recv_timeout = 30000
 
 # Locate the first CRLF in `bs`, returning (before, after). O(n^2) but
@@ -327,16 +337,16 @@ read_n socket buf n =
   }
 
 # Discards trailer headers up to and including the terminating empty line.
-fun consume_trailers : Tcp.Socket -> BitString -> Result BitString ParseError
-consume_trailers socket buf = case read_line socket buf max_trailer_size {
+fun consume_trailers : Config -> Tcp.Socket -> BitString -> Result BitString ParseError
+consume_trailers config socket buf = case read_line socket buf config.max_trailer_size {
   Err e -> Err e
   Ok (line, rest) ->
     if BitString.size line == 0 then Ok rest
-    else consume_trailers socket rest
+    else consume_trailers config socket rest
 }
 
 fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError
-read_chunked config socket buf acc = case read_line socket buf max_chunk_line_size {
+read_chunked config socket buf acc = case read_line socket buf config.max_chunk_line_size {
   Err e -> Err e
   Ok (line, after_size) -> case parse_chunk_size line {
     Nothing -> Err BadRequest
@@ -345,7 +355,7 @@ read_chunked config socket buf acc = case read_line socket buf max_chunk_line_si
 }
 
 fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError
-read_chunk_body _config socket buf acc 0 = case consume_trailers socket buf {
+read_chunk_body config socket buf acc 0 = case consume_trailers config socket buf {
   Err e -> Err e
   Ok rest -> Ok (acc, rest)
 }

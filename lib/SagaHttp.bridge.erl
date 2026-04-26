@@ -7,8 +7,8 @@
     send/2,
     close/1,
     local_port/1,
-    decode_request_line/1,
-    decode_header/1,
+    decode_request_line/2,
+    decode_header/2,
     setopts/2,
     peername/1
 ]).
@@ -62,9 +62,11 @@ close(Socket) ->
     gen_tcp:close(Socket),
     unit.
 
-% http_bin parses the request line (GET /path HTTP/1.1)
-decode_request_line(Data) ->
-    case erlang:decode_packet(http_bin, Data, []) of
+% http_bin parses the request line (GET /path HTTP/1.1).
+% MaxSize bounds the packet body length per decode_packet's packet_size
+% option; lines exceeding it return {error, _} which we map to BadRequest.
+decode_request_line(Data, MaxSize) ->
+    case erlang:decode_packet(http_bin, Data, [{packet_size, MaxSize}]) of
         {ok, {http_request, Method, {abs_path, Path}, {Major, Minor}}, Rest} ->
             MethodBin =
                 if
@@ -82,8 +84,8 @@ decode_request_line(Data) ->
     end.
 
 % httph_bin parses headers and end-of-headers
-decode_header(Data) ->
-    case erlang:decode_packet(httph_bin, Data, []) of
+decode_header(Data, MaxSize) ->
+    case erlang:decode_packet(httph_bin, Data, [{packet_size, MaxSize}]) of
         {ok, {http_header, _, Name, _, Value}, Rest} ->
             NameBin =
                 if
