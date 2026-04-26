@@ -4,18 +4,25 @@ import Std.Actor (Process, Timer, beam_actor)
 import Std.BitString
 import Std.Test (Testing, Test, describe, test, assert_true)
 import SagaHttp.Http
+import SagaHttp.Http (Chunked)
 import SagaHttp.Tcp
 
 val test_port = 18765
 
 fun handle : Http.Request -> Http.Response
-handle req = case req.body {
-  Just body -> case BitString.to_string body {
-    Ok s -> Http.text 200 $"echo: {s}"
-    Err _ -> Http.text 500 "binary body"
+handle req =
+  if req.path == "/stream" then
+    Http.stream 200 (Dict.from_list [("Content-Type", "text/plain")]) (fun () -> {
+      write_chunk! (BitString.from_string "alpha")
+      write_chunk! (BitString.from_string "beta")
+    })
+  else case req.body {
+    Just body -> case BitString.to_string body {
+      Ok s -> Http.text 200 $"echo: {s}"
+      Err _ -> Http.text 500 "binary body"
+    }
+    Nothing -> Http.text 200 $"path: {req.path}"
   }
-  Nothing -> Http.text 200 $"path: {req.path}"
-}
 
 # Convert a received BitString to a String for assertion. Tests only use
 # ASCII responses, so the conversion always succeeds.
@@ -25,13 +32,22 @@ resp_to_string bs = case BitString.to_string bs {
   Err _ -> "<non-utf8 response>"
 }
 
+# Reads from the socket until the server closes the connection (or times out
+# with no data). This matches what a real client does — necessary for
+# streamed responses where the body arrives across multiple sends.
+fun recv_all : Tcp.Socket -> BitString -> Result BitString String
+recv_all sock acc = case Tcp.recv sock 0 5000 {
+  Ok more -> recv_all sock (acc <> more)
+  Err _ -> if BitString.size acc == 0 then Err "no data" else Ok acc
+}
+
 # Send raw bytes on a fresh connection, return the response as a String.
 fun request : String -> Result String String
 request raw = case Tcp.connect "127.0.0.1" test_port 5000 {
   Err e -> Err e
   Ok sock -> {
     let _ = Tcp.send sock (BitString.from_string raw)
-    let r = Tcp.recv sock 0 5000
+    let r = recv_all sock <<>>
     let _ = Tcp.close sock
     case r {
       Ok bs -> Ok (resp_to_string bs)
@@ -210,6 +226,20 @@ tests () = {
         "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\nbody"
       case request req {
         Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "streamed response uses Transfer-Encoding: chunked" (fun () -> {
+      case request "GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "Transfer-Encoding: chunked" r
+          # Each chunk: <hex-size>\r\n<data>\r\n; terminated by 0\r\n\r\n
+          assert_contains "5\r\nalpha\r\n" r
+          assert_contains "4\r\nbeta\r\n" r
+          assert_contains "0\r\n\r\n" r
+        }
         Err _ -> assert_true False
       }
     })

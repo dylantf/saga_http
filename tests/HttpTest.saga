@@ -12,6 +12,7 @@ import Std.Test (
   assert_err
 )
 import SagaHttp.Http
+import SagaHttp.Http (Chunked)
 
 fun req_with : Http.HttpVersion -> Dict String String -> Http.Request
 req_with version headers = Request {
@@ -144,7 +145,10 @@ tests () = {
     test "sets status and body" (fun () -> {
       let resp = Http.text 404 "not found"
       assert_eq resp.status 404
-      assert_eq resp.body "not found"
+      case resp.body {
+        Http.Buffered s -> assert_eq s "not found"
+        _ -> assert_true False
+      }
     })
   })
 
@@ -156,6 +160,56 @@ tests () = {
     test "payload_too_large is 413 with Connection: close" (fun () -> {
       assert_eq Http.payload_too_large.status 413
       assert_eq (Dict.get "Connection" Http.payload_too_large.headers) (Just "close")
+    })
+  })
+
+  describe "stream constructor" (fun () -> {
+    test "produces a Streamed body" (fun () -> {
+      let resp = Http.stream 200 (Dict.new ()) (fun () -> ())
+      case resp.body {
+        Http.Streamed _ -> assert_true True
+        _ -> assert_true False
+      }
+    })
+
+    test "collect handler captures every chunk" (fun () -> {
+      let resp = Http.stream 200 (Dict.new ()) (fun () -> {
+        write_chunk! (BitString.from_string "first")
+        write_chunk! (BitString.from_string "second")
+      })
+      case resp.body {
+        Http.Streamed producer -> {
+          let chunks = producer () with {
+            write_chunk data = {
+              let rest = resume ()
+              data :: rest
+            }
+            return _ = []
+          }
+          assert_eq (List.length chunks) 2
+        }
+        _ -> assert_true False
+      }
+    })
+
+    test "concat handler joins all chunks" (fun () -> {
+      let resp = Http.stream 200 (Dict.new ()) (fun () -> {
+        write_chunk! (BitString.from_string "hello ")
+        write_chunk! (BitString.from_string "world")
+      })
+      case resp.body {
+        Http.Streamed producer -> {
+          let body = producer () with {
+            write_chunk data = {
+              let rest = resume ()
+              data <> rest
+            }
+            return _ = <<>>
+          }
+          assert_eq (BitString.to_string body) (Ok "hello world")
+        }
+        _ -> assert_true False
+      }
     })
   })
 }

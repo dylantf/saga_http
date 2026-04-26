@@ -2,6 +2,7 @@ module SagaHttp.Http
 
 import Std.Actor (Process)
 import Std.BitString
+import Std.Int
 import SagaHttp.Tcp
 
 # -- Parsing primitives --
@@ -32,10 +33,18 @@ pub record Request {
   body: Maybe BitString,
 }
 
+pub effect Chunked {
+  fun write_chunk : BitString -> Unit
+}
+
+pub type ResponseBody =
+  | Buffered String
+  | Streamed (Unit -> Unit needs {Chunked})
+
 pub record Response {
   status: Int,
   headers: Dict String String,
-  body: String,
+  body: ResponseBody,
 }
 
 pub type ParseError = BadRequest | PayloadTooLarge deriving (Debug, Eq)
@@ -45,10 +54,7 @@ pub record Config {
   max_body_size: Int,
 }
 
-pub val default_config = Config {
-  port: 8080,
-  max_body_size: 1048576,
-}
+pub val default_config = Config { port: 8080, max_body_size: 1048576 }
 
 # -- Response helpers --
 
@@ -56,7 +62,14 @@ pub fun text : Int -> String -> Response
 text status body = Response {
   status: status,
   headers: Dict.from_list [("Content-Type", "text/plain")],
-  body: body,
+  body: Buffered body,
+}
+
+pub fun stream : Int -> Dict String String -> (Unit -> Unit needs {Chunked}) -> Response
+stream status headers producer = Response {
+  status: status,
+  headers: headers,
+  body: Streamed producer,
 }
 
 pub fun status_text : Int -> String
@@ -79,16 +92,81 @@ encode_headers headers =
     acc <> key <> ": " <> value <> "\r\n"
   }) ""
 
+# Pure: encodes a buffered response as a single BitString.
+# Panics if called with a Streamed response — use send_response instead.
 pub fun encode_response : (method: String) -> Response -> BitString
-encode_response method resp = {
-  let body_len = show (String.byte_size resp.body)
-  let headers = Dict.put "Content-Length" body_len resp.headers
-  let head = $"HTTP/1.1 {show resp.status} {status_text resp.status}\r\n"
+encode_response method resp = case resp.body {
+  Buffered body -> encode_buffered_bytes method resp.status resp.headers body
+  Streamed _ ->
+    panic "encode_response: cannot encode a Streamed response, use send_response"
+}
+
+fun encode_buffered_bytes : String -> Int -> Dict String String -> String -> BitString
+encode_buffered_bytes method status headers body = {
+  let body_len = show (String.byte_size body)
+  let headers = Dict.put "Content-Length" body_len headers
+  let head = $"HTTP/1.1 {show status} {status_text status}\r\n"
     <> encode_headers headers
     <> "\r\n"
   let head_bits = BitString.from_string head
   if method == "HEAD" then head_bits
-  else head_bits <> BitString.from_string resp.body
+  else head_bits <> BitString.from_string body
+}
+
+fun encode_streamed_head : Int -> Dict String String -> BitString
+encode_streamed_head status headers = {
+  let headers = Dict.put "Transfer-Encoding" "chunked" headers
+  BitString.from_string ($"HTTP/1.1 {show status} {status_text status}\r\n"
+    <> encode_headers headers
+    <> "\r\n")
+}
+
+fun chunked_socket : Tcp.Socket -> Handler Chunked
+chunked_socket socket = handler for Chunked {
+  write_chunk data = {
+    let size = BitString.size data
+    if size == 0 then resume ()
+    else {
+      let head = BitString.from_string $"{Int.to_hex size}\r\n"
+      let tail = BitString.from_string "\r\n"
+      case Tcp.send socket (head <> data <> tail) {
+        Ok _ -> resume ()
+        # Don't resume — the producer's continuation is dropped, the
+        # stream aborts immediately, and we don't fire `return` (no
+        # point trying to send the terminator on a dead socket).
+        # TODO: route this through a server-side observability effect
+        # once we have one (see docs/planning/http1.md).
+        Err e -> {
+          let _ = dbg ("chunked send failed: ", e)
+          ()
+        }
+      }
+    }
+  }
+  return _ = {
+    let _ = Tcp.send socket (BitString.from_string "0\r\n\r\n")
+    ()
+  }
+}
+
+# Sends a response over the socket, choosing the buffered or chunked
+# wire format based on the body variant.
+pub fun send_response : Tcp.Socket -> String -> Response -> Unit
+send_response socket method resp = case resp.body {
+  Buffered body -> {
+    let _ =
+      Tcp.send socket (encode_buffered_bytes method resp.status resp.headers body)
+    ()
+  }
+  Streamed producer -> {
+    let _ = Tcp.send socket (encode_streamed_head resp.status resp.headers)
+    if method == "HEAD" then ()
+    else {
+      let h = chunked_socket socket
+      let _ = producer () with h
+      ()
+    }
+  }
 }
 
 pub fun bad_request : Response
@@ -98,7 +176,7 @@ bad_request = Response {
     ("Content-Type", "text/plain"),
     ("Connection", "close"),
   ],
-  body: "Bad Request",
+  body: Buffered "Bad Request",
 }
 
 pub fun payload_too_large : Response
@@ -108,7 +186,7 @@ payload_too_large = Response {
     ("Content-Type", "text/plain"),
     ("Connection", "close"),
   ],
-  body: "Payload Too Large",
+  body: Buffered "Payload Too Large",
 }
 
 # -- Request parsing --
@@ -153,9 +231,7 @@ read_body config socket headers rest = {
   let cl = Dict.get "content-length" headers
   case te {
     Just te_val ->
-      if te_val != "chunked" then
-        # Reject unsupported Transfer-Encoding rather than silently fall through.
-        Err BadRequest
+      if te_val != "chunked" then Err BadRequest
       else case cl {
         # Per RFC 7230, both TE and CL together is suspect: reject.
         Just _ -> Err BadRequest
@@ -216,11 +292,11 @@ parse_chunk_size bs = parse_hex_loop bs 0 0
 fun parse_hex_loop : BitString -> Int -> Int -> Maybe Int
 parse_hex_loop bs acc count = case bs {
   <<c:8, rest/binary>> when c >= 48 && c <= 57 ->
-    parse_hex_loop rest (acc * 16 + (c - 48)) (count + 1)
+    parse_hex_loop rest (acc * 16 + c - 48) (count + 1)
   <<c:8, rest/binary>> when c >= 97 && c <= 102 ->
-    parse_hex_loop rest (acc * 16 + (c - 97 + 10)) (count + 1)
+    parse_hex_loop rest (acc * 16 + c - 97 + 10) (count + 1)
   <<c:8, rest/binary>> when c >= 65 && c <= 70 ->
-    parse_hex_loop rest (acc * 16 + (c - 65 + 10)) (count + 1)
+    parse_hex_loop rest (acc * 16 + c - 65 + 10) (count + 1)
   _ -> if count == 0 then Nothing else Just acc
 }
 
@@ -310,12 +386,12 @@ handle_connection config socket on_request = {
           BadRequest -> bad_request
           PayloadTooLarge -> payload_too_large
         }
-        let _ = Tcp.send socket (encode_response "GET" resp)
+        let _ = send_response socket "GET" resp
         Tcp.close socket
       }
       Ok req -> {
         let resp = on_request req
-        let _ = Tcp.send socket (encode_response req.method resp)
+        let _ = send_response socket req.method resp
         if should_keep_alive req then handle_connection config socket on_request
         else Tcp.close socket
       }
