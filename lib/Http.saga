@@ -49,6 +49,7 @@ status_text code = case code {
   204 -> "No Content"
   400 -> "Bad Request"
   404 -> "Not Found"
+  413 -> "Payload Too Large"
   500 -> "Internal Server Error"
   _ -> "Unknown"
 }
@@ -79,7 +80,12 @@ parse_version v = case v {
   _ -> Http1_0
 }
 
-fun parse_request : Tcp.Socket -> String -> Result Request String
+pub type ParseError = BadRequest | PayloadTooLarge
+
+# 1 MiB
+val max_body_size = 1048576
+
+fun parse_request : Tcp.Socket -> String -> Result Request ParseError
 parse_request socket input = do {
   Ok (method, path, version, rest) <- decode_request_line input
   Ok (headers, rest) <- decode_headers (Dict.new ()) rest
@@ -92,30 +98,33 @@ parse_request socket input = do {
     body: body,
   })
 } else {
-  _ -> Err "failed to parse request"
+  Err PayloadTooLarge -> Err PayloadTooLarge
+  _ -> Err BadRequest
 }
 
-fun decode_headers : Dict String String -> String -> Result (Dict String String, String) String
+fun decode_headers : Dict String String -> String -> Result (Dict String String, String) ParseError
 decode_headers headers text = case decode_header text {
   Ok (Header key value rest) ->
     decode_headers (Dict.put (String.to_lower key) value headers) rest
   Ok (Done rest) -> Ok (headers, rest)
-  Err e -> Err e
+  Err _ -> Err BadRequest
 }
 
-fun read_body : Tcp.Socket -> Dict String String -> String -> Result (Maybe String) String
+fun read_body : Tcp.Socket -> Dict String String -> String -> Result (Maybe String) ParseError
 read_body socket headers rest = case Dict.get "content-length" headers {
   Nothing -> Ok Nothing
   Just len_str -> case Int.parse len_str {
-    Nothing -> Err "invalid content-length"
-    Just len -> {
-      let have = String.byte_size rest
-      if have >= len then Ok (Just (String.slice 0 len rest))
-      else case Tcp.recv socket (len - have) 30000 {
-        Err e -> Err e
-        Ok more -> Ok (Just (rest <> more))
+    Nothing -> Err BadRequest
+    Just len ->
+      if len > max_body_size then Err PayloadTooLarge
+      else {
+        let have = String.byte_size rest
+        if have >= len then Ok (Just (String.slice 0 len rest))
+        else case Tcp.recv socket (len - have) 30000 {
+          Err _ -> Err BadRequest
+          Ok more -> Ok (Just (rest <> more))
+        }
       }
-    }
   }
 }
 
@@ -138,8 +147,12 @@ handle_connection socket on_request = {
   case Tcp.recv socket 0 30000 {
     Err _ -> Tcp.close socket
     Ok data -> case parse_request socket data {
-      Err _ -> {
-        let _ = Tcp.send socket (encode_response "GET" bad_request)
+      Err err -> {
+        let resp = case err {
+          BadRequest -> bad_request
+          PayloadTooLarge -> payload_too_large
+        }
+        let _ = Tcp.send socket (encode_response "GET" resp)
         Tcp.close socket
       }
       Ok req -> {
@@ -160,6 +173,16 @@ bad_request = Response {
     ("Connection", "close"),
   ],
   body: "Bad Request",
+}
+
+fun payload_too_large : Response
+payload_too_large = Response {
+  status: 413,
+  headers: Dict.from_list [
+    ("Content-Type", "text/plain"),
+    ("Connection", "close"),
+  ],
+  body: "Payload Too Large",
 }
 
 fun accept_loop : Tcp.ListenSocket -> (Request -> Response) -> Unit
