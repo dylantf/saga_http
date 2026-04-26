@@ -50,14 +50,14 @@ close(Socket) ->
 % http_bin parses the request line (GET /path HTTP/1.1)
 decode_request_line(Data) ->
     case erlang:decode_packet(http_bin, Data, []) of
-        {ok, {http_request, Method, {abs_path, Path}, _Version}, Rest} ->
+        {ok, {http_request, Method, {abs_path, Path}, {Major, Minor}}, Rest} ->
             MethodBin =
                 if
                     is_atom(Method) -> atom_to_binary(Method);
                     is_binary(Method) -> Method;
                     true -> iolist_to_binary(io_lib:format("~p", [Method]))
                 end,
-            {ok, {MethodBin, Path, Rest}};
+            {ok, {MethodBin, Path, {Major, Minor}, Rest}};
         {more, _} ->
             {error, <<"incomplete">>};
         {error, _Reason} ->
