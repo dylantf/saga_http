@@ -61,14 +61,14 @@ encode_headers headers =
     acc <> key <> ": " <> value <> "\r\n"
   }) ""
 
-fun encode_response : Response -> String
-encode_response resp = {
+fun encode_response : (method: String) -> Response -> String
+encode_response method resp = {
   let body_len = show (String.byte_size resp.body)
   let headers = Dict.put "Content-Length" body_len resp.headers
-  $"HTTP/1.1 {show resp.status} {status_text resp.status}\r\n"
+  let head = $"HTTP/1.1 {show resp.status} {status_text resp.status}\r\n"
     <> encode_headers headers
     <> "\r\n"
-    <> resp.body
+  if method == "HEAD" then head else head <> resp.body
 }
 
 # -- Request parsing --
@@ -139,12 +139,12 @@ handle_connection socket on_request = {
     Err _ -> Tcp.close socket
     Ok data -> case parse_request socket data {
       Err _ -> {
-        let _ = Tcp.send socket (encode_response bad_request)
+        let _ = Tcp.send socket (encode_response "GET" bad_request)
         Tcp.close socket
       }
       Ok req -> {
         let resp = on_request req
-        let _ = Tcp.send socket (encode_response resp)
+        let _ = Tcp.send socket (encode_response req.method resp)
         if should_keep_alive req then handle_connection socket on_request
         else Tcp.close socket
       }
