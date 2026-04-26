@@ -59,8 +59,13 @@ pub record Response {
   body: ResponseBody,
 }
 
-pub type ParseError = BadRequest | PayloadTooLarge | ExpectationFailed
+pub type ParseError =
+  | BadRequest
+  | PayloadTooLarge
+  | ExpectationFailed
   deriving (Debug, Eq)
+
+type HeaderReadError = HeaderReadBadRequest | HeaderReadClosed
 
 pub record Config {
   port: Int,
@@ -74,6 +79,11 @@ pub record Config {
   max_chunk_line_size: Int,
   # Cap on the trailer-headers section after the final 0-size chunk.
   max_trailer_size: Int,
+  # Cap on the cumulative size of the request line + all headers (everything
+  # before the body). We keep reading from the socket until we see the
+  # `\r\n\r\n` that ends the headers section, but bail with 400 if the
+  # buffer grows past this without finding it (slowloris defense).
+  max_request_headers_size: Int,
   # Sent as the `Server` response header (unless the user already set one).
   # Set to "" to opt out of identifying the software.
   server_name: String,
@@ -94,6 +104,7 @@ pub val default_config = Config {
   max_header_size: 8192,
   max_chunk_line_size: 1024,
   max_trailer_size: 8192,
+  max_request_headers_size: 65536,
   server_name: "saga_http",
   idle_timeout_ms: 30000,
   read_timeout_ms: 30000,
@@ -132,10 +143,11 @@ find_all_headers name headers = {
 pub fun replace_header : String -> String -> List (String, String) -> List (String, String)
 replace_header name value headers = {
   let target = String.to_lower name
-  let kept = List.filter (fun pair -> {
-    let (n, _) = pair
-    String.to_lower n != target
-  }) headers
+  let kept =
+    List.filter (fun pair -> {
+      let (n, _) = pair
+      String.to_lower n != target
+    }) headers
   List.append kept [(name, value)]
 }
 
@@ -177,12 +189,74 @@ status_text code = case code {
   _ -> "Unknown"
 }
 
+# RFC 9110 §5.1: header names must be `token` characters only (alphanumerics
+# plus the printable specials below). Anything else (CTLs, whitespace, ":",
+# tspecials, non-ASCII) is invalid; we skip such headers entirely to defend
+# against smuggling via user-controlled names.
+#
+# tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+#         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+fun is_tchar : Int -> Bool
+is_tchar c = c >= 65 && c <= 90 # A-Z
+  || c >= 97 && c <= 122 # a-z
+  || c >= 48 && c <= 57 # 0-9
+  || c == 33 # !
+  || c == 35 # #
+  || c == 36 # $
+  || c == 37 # %
+  || c == 38 # &
+  || c == 39 # '
+  || c == 42 # *
+  || c == 43 # +
+  || c == 45 # -
+  || c == 46 # .
+  || c == 94 # ^
+  || c == 95 # _
+  || c == 96 # `
+  || c == 124 # |
+  || c == 126 # ~
+
+fun all_tchars : BitString -> Bool
+all_tchars bs = case bs {
+  <<>> -> True
+  <<c:8, rest/binary>> -> if is_tchar c then all_tchars rest else False
+}
+
+fun valid_header_name : String -> Bool
+valid_header_name name = String.byte_size name > 0
+  && all_tchars (BitString.from_string name)
+
+# Header *values* technically permit a wider character set, but CR and LF
+# would let a caller split the response and inject arbitrary headers/body
+# (CRLF injection). Replace them with space at the byte level rather than
+# dropping the header — the user's value still appears on the wire, just
+# neutralised.
+fun sanitize_header_value : String -> String
+sanitize_header_value value = case BitString.to_string (sanitize_bytes (BitString.from_string value) <<>>) {
+  Ok s -> s
+  Err _ -> ""
+}
+
+fun sanitize_bytes : BitString -> BitString -> BitString
+sanitize_bytes bs acc = case bs {
+  <<>> -> acc
+  <<c:8, rest/binary>> -> {
+    let safe = if c == 13 || c == 10 then 32 else c
+    sanitize_bytes rest (acc <> BitString.from_byte safe)
+  }
+}
+
 pub fun encode_headers : List (String, String) -> String
 encode_headers headers =
   headers
   |> List.foldl (fun acc entry -> {
     let (key, value) = entry
-    acc <> key <> ": " <> value <> "\r\n"
+    if valid_header_name key then acc
+      <> key
+      <> ": "
+      <> sanitize_header_value value
+      <> "\r\n"
+    else acc
   }) ""
 
 # Pure: encodes a buffered response as a single BitString.
@@ -208,10 +282,24 @@ encode_buffered_bytes method status headers body = {
 
 fun encode_streamed_head : Int -> List (String, String) -> BitString
 encode_streamed_head status headers = {
-  let headers = replace_header "Transfer-Encoding" "chunked" headers
+  # A streamed response is framed by Transfer-Encoding: chunked alone;
+  # mixing in a Content-Length is a protocol violation that confuses
+  # clients/proxies, so drop any user-supplied one before emitting.
+  let no_cl = remove_header "Content-Length" headers
+  let with_te = replace_header "Transfer-Encoding" "chunked" no_cl
   BitString.from_string ($"HTTP/1.1 {show status} {status_text status}\r\n"
-    <> encode_headers headers
+    <> encode_headers with_te
     <> "\r\n")
+}
+
+# Drop every entry with this name, case-insensitively.
+pub fun remove_header : String -> List (String, String) -> List (String, String)
+remove_header name headers = {
+  let target = String.to_lower name
+  List.filter (fun pair -> {
+    let (n, _) = pair
+    String.to_lower n != target
+  }) headers
 }
 
 fun chunked_socket : Tcp.Socket -> Handler Chunked
@@ -274,28 +362,19 @@ send_response config socket method resp = {
 
 pub val bad_request = Response {
   status: 400,
-  headers: [
-    ("Content-Type", "text/plain"),
-    ("Connection", "close"),
-  ],
+  headers: [("Content-Type", "text/plain"), ("Connection", "close")],
   body: Buffered "Bad Request",
 }
 
 pub val payload_too_large = Response {
   status: 413,
-  headers: [
-    ("Content-Type", "text/plain"),
-    ("Connection", "close"),
-  ],
+  headers: [("Content-Type", "text/plain"), ("Connection", "close")],
   body: Buffered "Payload Too Large",
 }
 
 pub val expectation_failed = Response {
   status: 417,
-  headers: [
-    ("Content-Type", "text/plain"),
-    ("Connection", "close"),
-  ],
+  headers: [("Content-Type", "text/plain"), ("Connection", "close")],
   body: Buffered "Expectation Failed",
 }
 
@@ -307,19 +386,25 @@ parse_version v = case v {
   _ -> Http1_0
 }
 
-pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result Request ParseError
+# Returns the parsed Request along with any leftover bytes after the body
+# (a non-empty leftover indicates a pipelined follow-up request, which we
+# don't support — the caller should close the connection).
+pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result (Request, BitString) ParseError
 parse_request config socket input = do {
   Ok (method, path, version_tuple, rest) <- decode_request_line input config.max_header_size
   Ok (headers, rest) <- decode_headers config [] rest
   Ok _ <- maybe_send_continue socket (parse_version version_tuple) headers
-  Ok body <- read_body config socket headers rest
-  Ok (Request {
-    method: method,
-    path: path,
-    version: parse_version version_tuple,
-    headers: headers,
-    body: body,
-  })
+  Ok (body, leftover) <- read_body config socket headers rest
+  Ok (
+    Request {
+      method: method,
+      path: path,
+      version: parse_version version_tuple,
+      headers: headers,
+      body: body,
+    },
+    leftover,
+  )
 } else {
   Err PayloadTooLarge -> Err PayloadTooLarge
   Err ExpectationFailed -> Err ExpectationFailed
@@ -337,7 +422,8 @@ maybe_send_continue socket version headers = case find_header "expect" headers {
     if String.to_lower v != "100-continue" then Err ExpectationFailed
     else case version {
       Http1_1 -> {
-        let _ = Tcp.send socket (BitString.from_string "HTTP/1.1 100 Continue\r\n\r\n")
+        let _ =
+          Tcp.send socket (BitString.from_string "HTTP/1.1 100 Continue\r\n\r\n")
         Ok ()
       }
       Http1_0 -> Ok ()
@@ -354,48 +440,76 @@ decode_headers config acc input = case decode_header input config.max_header_siz
   Err _ -> Err BadRequest
 }
 
-pub fun read_body : Config -> Tcp.Socket -> List (String, String) -> BitString -> Result (Maybe BitString) ParseError
-read_body config socket headers rest = {
-  let te = case find_header "transfer-encoding" headers {
-    Just v -> Just (String.to_lower v)
-    Nothing -> Nothing
-  }
-  let cl = find_header "content-length" headers
-  case te {
-    Just te_val ->
-      if te_val != "chunked" then Err BadRequest
-      else case cl {
-        # Per RFC 7230, both TE and CL together is suspect: reject.
-        Just _ -> Err BadRequest
-        Nothing -> case read_chunked config socket rest <<>> {
-          Ok (body, _leftover) -> Ok (Just body)
-          Err e -> Err e
+# Returns the parsed body (if any) along with any bytes that remained
+# in the buffer after the body. Callers should treat non-empty leftover
+# as a pipelined-request signal and close the connection (we don't
+# support pipelining — see docs/planning/http1.md).
+pub fun read_body : Config -> Tcp.Socket -> List (String, String) -> BitString -> Result (Maybe BitString, BitString) ParseError
+read_body config socket headers rest = case validate_framing headers {
+  Err e -> Err e
+  Ok _ -> {
+    let te = case find_header "transfer-encoding" headers {
+      Just v -> Just (String.to_lower v)
+      Nothing -> Nothing
+    }
+    let cl = find_header "content-length" headers
+    case te {
+      Just te_val ->
+        if te_val != "chunked" then Err BadRequest
+        else case cl {
+          # Per RFC 7230, both TE and CL together is suspect: reject.
+          Just _ -> Err BadRequest
+          Nothing -> case read_chunked config socket rest <<>> {
+            Ok (body, leftover) -> Ok (Just body, leftover)
+            Err e -> Err e
+          }
         }
+      Nothing -> case cl {
+        Nothing -> Ok (Nothing, rest)
+        Just len_str -> read_with_content_length config socket rest len_str
       }
-    Nothing -> case cl {
-      Nothing -> Ok Nothing
-      Just len_str -> read_with_content_length config socket rest len_str
     }
   }
 }
 
-fun read_with_content_length : Config -> Tcp.Socket -> BitString -> String -> Result (Maybe BitString) ParseError
+# Defends against request smuggling per RFC 7230 §3.3.3:
+#   - Multiple Transfer-Encoding header lines are forbidden (must be a
+#     single ordered list within one header line).
+#   - Multiple Content-Length lines are only acceptable if every value
+#     parses identically; otherwise the message is suspect.
+fun validate_framing : List (String, String) -> Result Unit ParseError
+validate_framing headers = case find_all_headers "transfer-encoding" headers {
+  _ :: _ :: _ -> Err BadRequest
+  _ -> case find_all_headers "content-length" headers {
+    [] -> Ok ()
+    [_] -> Ok ()
+    h :: tail ->
+      if List.all (fun v -> v == h) tail then Ok () else Err BadRequest
+  }
+}
+
+fun read_with_content_length : Config -> Tcp.Socket -> BitString -> String -> Result (Maybe BitString, BitString) ParseError
 read_with_content_length config socket rest len_str = case Int.parse len_str {
   Nothing -> Err BadRequest
+  # RFC 9110 §8.6: Content-Length is a non-negative integer. A negative
+  # value (or one with a sign prefix) is malformed and must be rejected
+  # before we let it flow into a `<<body:len/binary, ..>>` pattern below.
+  Just len when len < 0 -> Err BadRequest
   Just len ->
     if len > config.max_body_size then Err PayloadTooLarge
-    else {
-      let have = BitString.size rest
-      if have >= len then case rest {
-        <<body:len/binary, _/binary>> -> Ok (Just body)
-        _ -> Err BadRequest
-      }
-      else case Tcp.recv socket (len - have) config.read_timeout_ms {
-        Err _ -> Err BadRequest
-        Ok more -> Ok (Just (rest <> more))
-      }
-    }
+    else read_content_length_bytes config socket rest len
 }
+
+fun read_content_length_bytes : Config -> Tcp.Socket -> BitString -> Int -> Result (Maybe BitString, BitString) ParseError
+read_content_length_bytes config socket buf len =
+  if BitString.size buf >= len then case buf {
+    <<body:len/binary, leftover/binary>> -> Ok (Just body, leftover)
+    _ -> Err BadRequest
+  }
+  else case Tcp.recv socket 0 config.read_timeout_ms {
+    Err _ -> Err BadRequest
+    Ok more -> read_content_length_bytes config socket (buf <> more) len
+  }
 
 # -- Chunked transfer encoding (request) --
 
@@ -412,6 +526,42 @@ find_crlf_at bs i =
     _ -> find_crlf_at bs (i + 1)
   }
 
+# Finds the end-of-headers marker ("\r\n\r\n"), returning the size of
+# the header section including the marker. We return a size rather than
+# Bool so the cumulative header cap is enforced even when one recv brings
+# in a complete oversized header block (possibly followed by body bytes).
+fun header_section_size : BitString -> Maybe Int
+header_section_size bs = header_section_size_at bs 0
+
+fun header_section_size_at : BitString -> Int -> Maybe Int
+header_section_size_at bs i =
+  if i + 4 > BitString.size bs then Nothing
+  else case bs {
+    <<_:i/binary, "\r\n\r\n", _/binary>> -> Just (i + 4)
+    _ -> header_section_size_at bs (i + 1)
+  }
+
+# Reads from the socket until the buffer contains the end-of-headers
+# marker (\r\n\r\n). Bails with BadRequest if the headers grow past
+# `max_request_headers_size` (slowloris defense) or if a recv fails.
+# `initial_timeout` is the wait for the *first* byte (idle timeout on
+# a keep-alive connection); subsequent reads use the read timeout.
+fun read_until_headers_complete : Config -> Tcp.Socket -> BitString -> Int -> Result BitString HeaderReadError
+read_until_headers_complete config socket buf timeout = case header_section_size buf {
+  Just size ->
+    if size > config.max_request_headers_size then Err HeaderReadBadRequest
+    else Ok buf
+  Nothing ->
+    if BitString.size buf
+      >= config.max_request_headers_size then Err HeaderReadBadRequest
+    else case Tcp.recv socket 0 timeout {
+      Err _ -> Err HeaderReadClosed
+      Ok more ->
+        read_until_headers_complete config socket (buf
+          <> more) config.read_timeout_ms
+    }
+}
+
 # Parse a chunk-size line: leading hex digits, optionally followed by
 # chunk extensions (";name=value"). Returns Nothing if no hex digits.
 pub fun parse_chunk_size : BitString -> Maybe Int
@@ -425,7 +575,12 @@ parse_hex_loop bs acc count = case bs {
     parse_hex_loop rest (acc * 16 + c - 97 + 10) (count + 1)
   <<c:8, rest/binary>> when c >= 65 && c <= 70 ->
     parse_hex_loop rest (acc * 16 + c - 65 + 10) (count + 1)
-  _ -> if count == 0 then Nothing else Just acc
+  # End of the line — `find_crlf` already stripped the trailing CRLF.
+  <<>> -> if count == 0 then Nothing else Just acc
+  # ';' starts a chunk extension (e.g. `5;name=value`); ignore the rest.
+  <<59, _/binary>> -> if count == 0 then Nothing else Just acc
+  # Anything else after the hex digits (e.g. `5oops`) is malformed.
+  _ -> Nothing
 }
 
 # Reads from the socket until `buf` contains a CRLF, returning
@@ -456,23 +611,21 @@ read_n socket buf n timeout =
 
 # Discards trailer headers up to and including the terminating empty line.
 fun consume_trailers : Config -> Tcp.Socket -> BitString -> Result BitString ParseError
-consume_trailers config socket buf =
-  case read_line socket buf config.max_trailer_size config.read_timeout_ms {
-    Err e -> Err e
-    Ok (line, rest) ->
-      if BitString.size line == 0 then Ok rest
-      else consume_trailers config socket rest
-  }
+consume_trailers config socket buf = case read_line socket buf config.max_trailer_size config.read_timeout_ms {
+  Err e -> Err e
+  Ok (line, rest) ->
+    if BitString.size line == 0 then Ok rest
+    else consume_trailers config socket rest
+}
 
 fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError
-read_chunked config socket buf acc =
-  case read_line socket buf config.max_chunk_line_size config.read_timeout_ms {
-    Err e -> Err e
-    Ok (line, after_size) -> case parse_chunk_size line {
-      Nothing -> Err BadRequest
-      Just size -> read_chunk_body config socket after_size acc size
-    }
+read_chunked config socket buf acc = case read_line socket buf config.max_chunk_line_size config.read_timeout_ms {
+  Err e -> Err e
+  Ok (line, after_size) -> case parse_chunk_size line {
+    Nothing -> Err BadRequest
+    Just size -> read_chunk_body config socket after_size acc size
   }
+}
 
 fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError
 read_chunk_body config socket buf acc 0 = case consume_trailers config socket buf {
@@ -496,36 +649,58 @@ read_chunk_body config socket buf acc size =
 
 pub fun should_keep_alive : Request -> Bool
 should_keep_alive req = case find_header "connection" req.headers {
-  Just "close" -> False
-  Just "keep-alive" -> True
-  _ -> case req.version {
-    Http1_1 -> True
-    Http1_0 -> False
+  Just v -> {
+    # Connection is a comma-separated token list (RFC 9110 §7.6.1), e.g.
+    # "Close", "keep-alive, upgrade", "Upgrade,Keep-Alive". Match
+    # case-insensitively on the lowercased tokens.
+    let tokens = connection_tokens v
+    if List.contains "close" tokens then False
+    else if List.contains "keep-alive" tokens then True
+    else version_default_keep_alive req.version
   }
+  Nothing -> version_default_keep_alive req.version
 }
+
+fun version_default_keep_alive : HttpVersion -> Bool
+version_default_keep_alive v = case v {
+  Http1_1 -> True
+  Http1_0 -> False
+}
+
+fun connection_tokens : String -> List String
+connection_tokens v =
+  String.split "," v
+  |> List.map String.trim
+  |> List.map String.to_lower
 
 # Reads requests in a loop until the client disconnects, times out,
 # or the connection should close.
 pub fun handle_connection : Config -> Tcp.Socket -> (Request -> Response) -> Unit
-handle_connection config socket on_request = {
-  case Tcp.recv socket 0 config.idle_timeout_ms {
-    Err _ -> Tcp.close socket
-    Ok data -> case parse_request config socket data {
-      Err err -> {
-        let resp = case err {
-          BadRequest -> bad_request
-          PayloadTooLarge -> payload_too_large
-          ExpectationFailed -> expectation_failed
-        }
-        let _ = send_response config socket "GET" resp
-        Tcp.close socket
+handle_connection config socket on_request = case read_until_headers_complete config socket <<>> config.idle_timeout_ms {
+  Err HeaderReadClosed -> Tcp.close socket
+  Err HeaderReadBadRequest -> {
+    let _ = send_response config socket "GET" bad_request
+    Tcp.close socket
+  }
+  Ok data -> case parse_request config socket data {
+    Err err -> {
+      let resp = case err {
+        BadRequest -> bad_request
+        PayloadTooLarge -> payload_too_large
+        ExpectationFailed -> expectation_failed
       }
-      Ok req -> {
-        let resp = on_request req
-        let _ = send_response config socket req.method resp
-        if should_keep_alive req then handle_connection config socket on_request
-        else Tcp.close socket
-      }
+      let _ = send_response config socket "GET" resp
+      Tcp.close socket
+    }
+    Ok (req, leftover) -> {
+      let resp = on_request req
+      let _ = send_response config socket req.method resp
+      # If anything remains in the buffer after the body, the client
+      # pipelined a follow-up request. We don't support pipelining,
+      # so close rather than letting the bytes hang the connection.
+      if BitString.size leftover > 0 then Tcp.close socket
+      else if should_keep_alive req then handle_connection config socket on_request
+      else Tcp.close socket
     }
   }
 }

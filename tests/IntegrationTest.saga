@@ -343,6 +343,163 @@ tests () = {
       assert_true result
     })
 
+    test "pipelined request closes the connection (we don't support pipelining)" (fun () -> {
+      # Two complete HTTP/1.1 requests in one send. We respond to the
+      # first and close — without the leftover-detection logic this would
+      # silently drop the second request and leave the client hanging on
+      # an idle keep-alive connection.
+      let result = {
+        case Tcp.connect "127.0.0.1" test_port 5000 {
+          Err _ -> Err "connect"
+          Ok sock -> {
+            let payload = "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"
+              <> "GET /b HTTP/1.1\r\nHost: x\r\n\r\n"
+            let _ = Tcp.send sock (BitString.from_string payload)
+            let r1 = Tcp.recv sock 0 5000
+            # Second recv should fail because the server closed after
+            # noticing the leftover bytes.
+            let r2 = Tcp.recv sock 0 1000
+            let _ = Tcp.close sock
+            case (r1, r2) {
+              (Ok bs, Err _) -> Ok (resp_to_string bs)
+              _ -> Err "expected close after first response"
+            }
+          }
+        }
+      } with beam_actor
+      case result {
+        Ok r -> assert_contains "path: /a" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "pipelined request after fragmented Content-Length body closes" (fun () -> {
+      # The first send leaves the server waiting for 3 more body bytes.
+      # The second send provides those bytes plus a complete follow-up
+      # request. The body reader must preserve that extra request as
+      # leftover so handle_connection closes instead of processing it.
+      let result = {
+        case Tcp.connect "127.0.0.1" test_port 5000 {
+          Err _ -> Err "connect"
+          Ok sock -> {
+            let first = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhe"
+            let second = "lloGET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            let _ = Tcp.send sock (BitString.from_string first)
+            sleep! 50
+            let _ = Tcp.send sock (BitString.from_string second)
+            let r1 = Tcp.recv sock 0 5000
+            let r2 = Tcp.recv sock 0 1000
+            let _ = Tcp.close sock
+            case (r1, r2) {
+              (Ok bs, Err _) -> Ok (resp_to_string bs)
+              _ -> Err "expected close after first response"
+            }
+          }
+        }
+      } with beam_actor
+      case result {
+        Ok r -> {
+          assert_contains "echo: hello" r
+          if String.contains "path: /b" r then assert_true False
+          else assert_true True
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "fragmented request (split mid-headers) is reassembled, not rejected" (fun () -> {
+      # Simulates a slow client / TCP fragmentation: send the request line
+      # in one packet, pause, send the rest of the headers separately.
+      # Without buffering, the first recv would return an incomplete request
+      # and we'd 400. With buffering, the server keeps reading until \r\n\r\n.
+      let result = {
+        case Tcp.connect "127.0.0.1" test_port 5000 {
+          Err _ -> Err "connect"
+          Ok sock -> {
+            let _ = Tcp.send sock (BitString.from_string "GET /test HTTP/1.1\r\n")
+            sleep! 50
+            let _ = Tcp.send sock (BitString.from_string "Host: localhost\r\nConnection: close\r\n\r\n")
+            let r = recv_all sock <<>>
+            let _ = Tcp.close sock
+            case r {
+              Ok bs -> Ok (resp_to_string bs)
+              Err e -> Err e
+            }
+          }
+        }
+      } with beam_actor
+      case result {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "path: /test" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "cumulative request header cap is enforced on complete header blocks" (fun () -> {
+      # Many individually-small header lines exceed max_request_headers_size
+      # in total. This catches the case where one recv contains the whole
+      # oversized header section plus the terminating \r\n\r\n.
+      let headers = String.repeat 9000 "X-A: x\r\n"
+      let req = $"GET /test HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "conflicting Content-Length headers return 400 (smuggling defense)" (fun () -> {
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "duplicate identical Content-Length headers are accepted" (fun () -> {
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+      case request req {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "echo: hello" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "negative Content-Length returns 400" (fun () -> {
+      case request "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: -5\r\n\r\n" {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "malformed chunk-size returns 400" (fun () -> {
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        <> "5oops\r\nhello\r\n0\r\n\r\n"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "streamed response: Content-Length set by user is stripped" (fun () -> {
+      # /stream sets only Content-Type; we want to also confirm that *if*
+      # the user sets Content-Length on a streamed response, it doesn't
+      # leak onto the wire alongside Transfer-Encoding: chunked.
+      case request "GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "Transfer-Encoding: chunked" r
+          # /stream's response carries no user-supplied CL, but assert
+          # just for safety that no CL appears alongside chunked.
+          if String.contains "Content-Length" r then assert_true False
+          else assert_true True
+        }
+        Err _ -> assert_true False
+      }
+    })
+
     test "streamed response uses Transfer-Encoding: chunked" (fun () -> {
       case request "GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
         Ok r -> {

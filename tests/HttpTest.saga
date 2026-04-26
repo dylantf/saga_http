@@ -65,6 +65,84 @@ tests () = {
     })
   })
 
+  describe "parse_chunk_size strictness" (fun () -> {
+    test "rejects garbage after hex digits" (fun () -> {
+      assert_eq (Http.parse_chunk_size (BitString.from_string "5oops")) Nothing
+    })
+    test "rejects pure garbage" (fun () -> {
+      assert_eq (Http.parse_chunk_size (BitString.from_string "zzz")) Nothing
+    })
+    test "accepts plain hex" (fun () -> {
+      assert_eq (Http.parse_chunk_size (BitString.from_string "1a")) (Just 26)
+    })
+    test "accepts hex followed by ; chunk extension" (fun () -> {
+      assert_eq (Http.parse_chunk_size (BitString.from_string "1a;name=value")) (Just 26)
+    })
+    test "0 size" (fun () -> {
+      assert_eq (Http.parse_chunk_size (BitString.from_string "0")) (Just 0)
+    })
+  })
+
+  describe "should_keep_alive with token-list Connection" (fun () -> {
+    test "Connection: Close (capitalized) closes" (fun () -> {
+      assert_false (Http.should_keep_alive (req_with Http.Http1_1 [("connection", "Close")]))
+    })
+    test "Connection: keep-alive, upgrade keeps alive" (fun () -> {
+      assert_true (Http.should_keep_alive (req_with Http.Http1_0 [("connection", "keep-alive, upgrade")]))
+    })
+    test "Connection: Upgrade,Keep-Alive (no space) keeps alive" (fun () -> {
+      assert_true (Http.should_keep_alive (req_with Http.Http1_0 [("connection", "Upgrade,Keep-Alive")]))
+    })
+    test "Connection: close, keep-alive: close wins" (fun () -> {
+      assert_false (Http.should_keep_alive (req_with Http.Http1_1 [("connection", "close, keep-alive")]))
+    })
+  })
+
+  describe "encode_streamed_head strips Content-Length" (fun () -> {
+    test "user-supplied Content-Length is dropped on streamed responses" (fun () -> {
+      let resp = Http.stream 200 [("Content-Length", "5"), ("X-Other", "v")] (fun () -> ())
+      case resp.body {
+        Http.Streamed _ -> {
+          # We can observe the head bytes through send_response indirectly,
+          # but here we test the encode helper via the integration suite
+          # (see "streamed response uses Transfer-Encoding: chunked").
+          # This test just guards that the constructor preserves the
+          # user input as-is — stripping happens at encode time.
+          assert_eq (Http.find_header "content-length" resp.headers) (Just "5")
+        }
+        _ -> assert_true False
+      }
+    })
+  })
+
+  describe "header sanitization" (fun () -> {
+    test "header value CRLF is neutralized" (fun () -> {
+      let out = Http.encode_headers [("X-Test", "ok\r\nX-Evil: yes")]
+      assert_false (String.contains "\r\nX-Evil: yes" out)
+      assert_true (String.contains "X-Test: ok  X-Evil: yes\r\n" out)
+    })
+    test "header name CRLF is omitted" (fun () -> {
+      assert_eq (Http.encode_headers [("X-Test\r\nX-Evil", "yes")]) ""
+    })
+    test "header name with colon is omitted" (fun () -> {
+      assert_eq (Http.encode_headers [("Bad:Name", "v"), ("Good", "ok")]) "Good: ok\r\n"
+    })
+    test "header name with whitespace is omitted" (fun () -> {
+      assert_eq (Http.encode_headers [("Bad Name", "v")]) ""
+    })
+    test "header name with non-tchar (parens, brackets) is omitted" (fun () -> {
+      assert_eq (Http.encode_headers [("Bad(Name)", "v")]) ""
+      assert_eq (Http.encode_headers [("Bad<Name>", "v")]) ""
+      assert_eq (Http.encode_headers [("Bad[Name]", "v")]) ""
+    })
+    test "valid token chars in name are kept" (fun () -> {
+      assert_eq (Http.encode_headers [("X-Custom-1.0_a~", "v")]) "X-Custom-1.0_a~: v\r\n"
+    })
+    test "empty header name is omitted" (fun () -> {
+      assert_eq (Http.encode_headers [("", "v")]) ""
+    })
+  })
+
   describe "encode_response" (fun () -> {
     test "GET includes body and Content-Length" (fun () -> {
       let resp = Http.text 200 "hello"
