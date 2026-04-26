@@ -16,10 +16,10 @@ pub fun connect : (host: String) -> (port: Int) -> (timeout: Int) -> Result Sock
 pub fun local_port : (socket: ListenSocket) -> Result Int String
 
 @external("erlang", "SagaHttp.bridge", "recv")
-pub fun recv : (socket: Socket) -> (length: Int) -> (timeout: Int) -> Result String String
+pub fun recv : (socket: Socket) -> (length: Int) -> (timeout: Int) -> Result BitString String
 
 @external("erlang", "SagaHttp.bridge", "send")
-pub fun send : (socket: Socket) -> (data: String) -> Result Unit String
+pub fun send : (socket: Socket) -> (data: BitString) -> Result Unit String
 
 @external("erlang", "SagaHttp.bridge", "close")
 pub fun close : (socket: Socket) -> Unit

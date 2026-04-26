@@ -1,6 +1,7 @@
 module IntegrationTest
 
 import Std.Actor (Process, Timer, beam_actor)
+import Std.BitString
 import Std.Test (Testing, Test, describe, test, assert_true)
 import SagaHttp.Http
 import SagaHttp.Tcp
@@ -9,19 +10,33 @@ val test_port = 18765
 
 fun handle : Http.Request -> Http.Response
 handle req = case req.body {
-  Just body -> Http.text 200 $"echo: {body}"
+  Just body -> case BitString.to_string body {
+    Ok s -> Http.text 200 $"echo: {s}"
+    Err _ -> Http.text 500 "binary body"
+  }
   Nothing -> Http.text 200 $"path: {req.path}"
 }
 
-# Send raw bytes on a fresh connection, return the response.
+# Convert a received BitString to a String for assertion. Tests only use
+# ASCII responses, so the conversion always succeeds.
+fun resp_to_string : BitString -> String
+resp_to_string bs = case BitString.to_string bs {
+  Ok s -> s
+  Err _ -> "<non-utf8 response>"
+}
+
+# Send raw bytes on a fresh connection, return the response as a String.
 fun request : String -> Result String String
 request raw = case Tcp.connect "127.0.0.1" test_port 5000 {
   Err e -> Err e
   Ok sock -> {
-    let _ = Tcp.send sock raw
+    let _ = Tcp.send sock (BitString.from_string raw)
     let r = Tcp.recv sock 0 5000
     let _ = Tcp.close sock
-    r
+    case r {
+      Ok bs -> Ok (resp_to_string bs)
+      Err e -> Err e
+    }
   }
 }
 
@@ -30,7 +45,7 @@ fun two_requests : String -> String -> Result (String, Result String String) Str
 two_requests first second = case Tcp.connect "127.0.0.1" test_port 5000 {
   Err e -> Err e
   Ok sock -> {
-    let _ = Tcp.send sock first
+    let _ = Tcp.send sock (BitString.from_string first)
     let r1 = Tcp.recv sock 0 5000
     case r1 {
       Err e -> {
@@ -38,10 +53,14 @@ two_requests first second = case Tcp.connect "127.0.0.1" test_port 5000 {
         Err e
       }
       Ok resp1 -> {
-        let _ = Tcp.send sock second
+        let _ = Tcp.send sock (BitString.from_string second)
         let r2 = Tcp.recv sock 0 5000
         let _ = Tcp.close sock
-        Ok (resp1, r2)
+        let r2_str = case r2 {
+          Ok bs -> Ok (resp_to_string bs)
+          Err e -> Err e
+        }
+        Ok (resp_to_string resp1, r2_str)
       }
     }
   }
@@ -130,6 +149,68 @@ tests () = {
         # First response succeeds, second recv fails because server closed
         Ok (resp1, Err _) -> assert_contains "path: /a" resp1
         _ -> assert_true False
+      }
+    })
+
+    test "chunked request body, single chunk" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        <> "5\r\nhello\r\n0\r\n\r\n"
+      case request req {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "echo: hello" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "chunked request body, multiple chunks" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        <> "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+      case request req {
+        Ok r -> assert_contains "echo: hello world" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "chunked request honors chunk extensions" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        <> "5;name=value\r\nhello\r\n0\r\n\r\n"
+      case request req {
+        Ok r -> assert_contains "echo: hello" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "chunked request with trailers (ignored)" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        <> "5\r\nhello\r\n0\r\nX-Trailer: ok\r\n\r\n"
+      case request req {
+        Ok r -> assert_contains "echo: hello" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "Transfer-Encoding + Content-Length together returns 400" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+        <> "5\r\nhello\r\n0\r\n\r\n"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "unsupported Transfer-Encoding returns 400" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\nbody"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
       }
     })
   })

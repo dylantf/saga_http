@@ -1,19 +1,24 @@
 module SagaHttp.Http
 
 import Std.Actor (Process)
+import Std.BitString
 import SagaHttp.Tcp
 
 # -- Parsing primitives --
 
+# Wire-level helpers from the bridge. The "rest" pieces are BitString
+# because they're opaque bytes; the structured fields are String because
+# we know they're ASCII text once decode_packet has parsed them.
+
 pub type HeaderResult =
-  | Header String String String
-  | Done String
+  | Header String String BitString
+  | Done BitString
 
 @external("erlang", "SagaHttp.bridge", "decode_request_line")
-pub fun decode_request_line : (data: String) -> Result (String, String, (Int, Int), String) String
+pub fun decode_request_line : (data: BitString) -> Result (String, String, (Int, Int), BitString) String
 
 @external("erlang", "SagaHttp.bridge", "decode_header")
-pub fun decode_header : (data: String) -> Result HeaderResult String
+pub fun decode_header : (data: BitString) -> Result HeaderResult String
 
 # -- Types --
 
@@ -24,7 +29,7 @@ pub record Request {
   path: String,
   version: HttpVersion,
   headers: Dict String String,
-  body: Maybe String,
+  body: Maybe BitString,
 }
 
 pub record Response {
@@ -74,14 +79,16 @@ encode_headers headers =
     acc <> key <> ": " <> value <> "\r\n"
   }) ""
 
-pub fun encode_response : (method: String) -> Response -> String
+pub fun encode_response : (method: String) -> Response -> BitString
 encode_response method resp = {
   let body_len = show (String.byte_size resp.body)
   let headers = Dict.put "Content-Length" body_len resp.headers
   let head = $"HTTP/1.1 {show resp.status} {status_text resp.status}\r\n"
     <> encode_headers headers
     <> "\r\n"
-  if method == "HEAD" then head else head <> resp.body
+  let head_bits = BitString.from_string head
+  if method == "HEAD" then head_bits
+  else head_bits <> BitString.from_string resp.body
 }
 
 pub fun bad_request : Response
@@ -112,7 +119,7 @@ parse_version v = case v {
   _ -> Http1_0
 }
 
-pub fun parse_request : Config -> Tcp.Socket -> String -> Result Request ParseError
+pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result Request ParseError
 parse_request config socket input = do {
   Ok (method, path, version, rest) <- decode_request_line input
   Ok (headers, rest) <- decode_headers (Dict.new ()) rest
@@ -129,31 +136,155 @@ parse_request config socket input = do {
   _ -> Err BadRequest
 }
 
-pub fun decode_headers : Dict String String -> String -> Result (Dict String String, String) ParseError
-decode_headers headers text = case decode_header text {
+pub fun decode_headers : Dict String String -> BitString -> Result (Dict String String, BitString) ParseError
+decode_headers headers input = case decode_header input {
   Ok (Header key value rest) ->
     decode_headers (Dict.put (String.to_lower key) value headers) rest
   Ok (Done rest) -> Ok (headers, rest)
   Err _ -> Err BadRequest
 }
 
-pub fun read_body : Config -> Tcp.Socket -> Dict String String -> String -> Result (Maybe String) ParseError
-read_body config socket headers rest = case Dict.get "content-length" headers {
-  Nothing -> Ok Nothing
-  Just len_str -> case Int.parse len_str {
-    Nothing -> Err BadRequest
-    Just len ->
-      if len > config.max_body_size then Err PayloadTooLarge
-      else {
-        let have = String.byte_size rest
-        if have >= len then Ok (Just (String.slice 0 len rest))
-        else case Tcp.recv socket (len - have) 30000 {
-          Err _ -> Err BadRequest
-          Ok more -> Ok (Just (rest <> more))
+pub fun read_body : Config -> Tcp.Socket -> Dict String String -> BitString -> Result (Maybe BitString) ParseError
+read_body config socket headers rest = {
+  let te = case Dict.get "transfer-encoding" headers {
+    Just v -> Just (String.to_lower v)
+    Nothing -> Nothing
+  }
+  let cl = Dict.get "content-length" headers
+  case te {
+    Just te_val ->
+      if te_val != "chunked" then
+        # Reject unsupported Transfer-Encoding rather than silently fall through.
+        Err BadRequest
+      else case cl {
+        # Per RFC 7230, both TE and CL together is suspect: reject.
+        Just _ -> Err BadRequest
+        Nothing -> case read_chunked config socket rest <<>> {
+          Ok (body, _leftover) -> Ok (Just body)
+          Err e -> Err e
         }
       }
+    Nothing -> case cl {
+      Nothing -> Ok Nothing
+      Just len_str -> read_with_content_length config socket rest len_str
+    }
   }
 }
+
+fun read_with_content_length : Config -> Tcp.Socket -> BitString -> String -> Result (Maybe BitString) ParseError
+read_with_content_length config socket rest len_str = case Int.parse len_str {
+  Nothing -> Err BadRequest
+  Just len ->
+    if len > config.max_body_size then Err PayloadTooLarge
+    else {
+      let have = BitString.size rest
+      if have >= len then case rest {
+        <<body:len/binary, _/binary>> -> Ok (Just body)
+        _ -> Err BadRequest
+      }
+      else case Tcp.recv socket (len - have) 30000 {
+        Err _ -> Err BadRequest
+        Ok more -> Ok (Just (rest <> more))
+      }
+    }
+}
+
+# -- Chunked transfer encoding (request) --
+
+val max_chunk_line_size = 1024
+val max_trailer_size = 8192
+val recv_timeout = 30000
+
+# Locate the first CRLF in `bs`, returning (before, after). O(n^2) but
+# only used on short lines (chunk-size and trailers, both bounded).
+fun find_crlf : BitString -> Maybe (BitString, BitString)
+find_crlf bs = find_crlf_at bs 0
+
+fun find_crlf_at : BitString -> Int -> Maybe (BitString, BitString)
+find_crlf_at bs i =
+  if i + 2 > BitString.size bs then Nothing
+  else case bs {
+    <<head:i/binary, "\r\n", rest/binary>> -> Just (head, rest)
+    _ -> find_crlf_at bs (i + 1)
+  }
+
+# Parse a chunk-size line: leading hex digits, optionally followed by
+# chunk extensions (";name=value"). Returns Nothing if no hex digits.
+pub fun parse_chunk_size : BitString -> Maybe Int
+parse_chunk_size bs = parse_hex_loop bs 0 0
+
+fun parse_hex_loop : BitString -> Int -> Int -> Maybe Int
+parse_hex_loop bs acc count = case bs {
+  <<c:8, rest/binary>> when c >= 48 && c <= 57 ->
+    parse_hex_loop rest (acc * 16 + (c - 48)) (count + 1)
+  <<c:8, rest/binary>> when c >= 97 && c <= 102 ->
+    parse_hex_loop rest (acc * 16 + (c - 97 + 10)) (count + 1)
+  <<c:8, rest/binary>> when c >= 65 && c <= 70 ->
+    parse_hex_loop rest (acc * 16 + (c - 65 + 10)) (count + 1)
+  _ -> if count == 0 then Nothing else Just acc
+}
+
+# Reads from the socket until `buf` contains a CRLF, returning
+# (line_without_crlf, rest_after_crlf). Bails if the line would exceed
+# `max_size`, to avoid unbounded reads on malicious input.
+fun read_line : Tcp.Socket -> BitString -> Int -> Result (BitString, BitString) ParseError
+read_line socket buf max_size = case find_crlf buf {
+  Just split -> Ok split
+  Nothing ->
+    if BitString.size buf >= max_size then Err BadRequest
+    else case Tcp.recv socket 0 recv_timeout {
+      Err _ -> Err BadRequest
+      Ok more -> read_line socket (buf <> more) max_size
+    }
+}
+
+# Ensures `buf` contains at least `n` bytes, returning (first_n, rest).
+fun read_n : Tcp.Socket -> BitString -> Int -> Result (BitString, BitString) ParseError
+read_n socket buf n =
+  if BitString.size buf >= n then case buf {
+    <<first:n/binary, rest/binary>> -> Ok (first, rest)
+    _ -> Err BadRequest
+  }
+  else case Tcp.recv socket (n - BitString.size buf) recv_timeout {
+    Err _ -> Err BadRequest
+    Ok more -> read_n socket (buf <> more) n
+  }
+
+# Discards trailer headers up to and including the terminating empty line.
+fun consume_trailers : Tcp.Socket -> BitString -> Result BitString ParseError
+consume_trailers socket buf = case read_line socket buf max_trailer_size {
+  Err e -> Err e
+  Ok (line, rest) ->
+    if BitString.size line == 0 then Ok rest
+    else consume_trailers socket rest
+}
+
+fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError
+read_chunked config socket buf acc = case read_line socket buf max_chunk_line_size {
+  Err e -> Err e
+  Ok (line, after_size) -> case parse_chunk_size line {
+    Nothing -> Err BadRequest
+    Just size -> read_chunk_body config socket after_size acc size
+  }
+}
+
+fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError
+read_chunk_body _config socket buf acc 0 = case consume_trailers socket buf {
+  Err e -> Err e
+  Ok rest -> Ok (acc, rest)
+}
+read_chunk_body config socket buf acc size =
+  if BitString.size acc + size > config.max_body_size then Err PayloadTooLarge
+  else case read_n socket buf size {
+    Err e -> Err e
+    Ok (chunk, after_chunk) -> case read_n socket after_chunk 2 {
+      Err e -> Err e
+      Ok (crlf, rest) -> case crlf {
+        <<"\r\n">> -> read_chunked config socket rest (acc <> chunk)
+        _ -> Err BadRequest
+      }
+    }
+  }
 
 # -- Server --
 
