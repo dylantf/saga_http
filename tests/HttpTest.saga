@@ -12,7 +12,7 @@ import Std.Test (
   assert_err
 )
 import SagaHttp.Http
-import SagaHttp.Http (Chunked)
+import SagaHttp.Http (Chunked, Server)
 
 fun req_with : Http.HttpVersion -> List (String, String) -> Http.Request
 req_with version headers = Request {
@@ -85,22 +85,34 @@ tests () = {
 
   describe "should_keep_alive with token-list Connection" (fun () -> {
     test "Connection: Close (capitalized) closes" (fun () -> {
-      assert_false (Http.should_keep_alive (req_with Http.Http1_1 [("connection", "Close")]))
+      assert_false (Http.should_keep_alive (req_with Http.Http1_1 [
+        ("connection", "Close"),
+      ]))
     })
     test "Connection: keep-alive, upgrade keeps alive" (fun () -> {
-      assert_true (Http.should_keep_alive (req_with Http.Http1_0 [("connection", "keep-alive, upgrade")]))
+      assert_true (Http.should_keep_alive (req_with Http.Http1_0 [
+        ("connection", "keep-alive, upgrade"),
+      ]))
     })
     test "Connection: Upgrade,Keep-Alive (no space) keeps alive" (fun () -> {
-      assert_true (Http.should_keep_alive (req_with Http.Http1_0 [("connection", "Upgrade,Keep-Alive")]))
+      assert_true (Http.should_keep_alive (req_with Http.Http1_0 [
+        ("connection", "Upgrade,Keep-Alive"),
+      ]))
     })
     test "Connection: close, keep-alive: close wins" (fun () -> {
-      assert_false (Http.should_keep_alive (req_with Http.Http1_1 [("connection", "close, keep-alive")]))
+      assert_false (Http.should_keep_alive (req_with Http.Http1_1 [
+        ("connection", "close, keep-alive"),
+      ]))
     })
   })
 
   describe "encode_streamed_head strips Content-Length" (fun () -> {
     test "user-supplied Content-Length is dropped on streamed responses" (fun () -> {
-      let resp = Http.stream 200 [("Content-Length", "5"), ("X-Other", "v")] (fun () -> ())
+      let resp =
+        Http.stream 200 [
+          ("Content-Length", "5"),
+          ("X-Other", "v"),
+        ] (fun () -> ())
       case resp.body {
         Http.Streamed _ -> {
           # We can observe the head bytes through send_response indirectly,
@@ -125,7 +137,10 @@ tests () = {
       assert_eq (Http.encode_headers [("X-Test\r\nX-Evil", "yes")]) ""
     })
     test "header name with colon is omitted" (fun () -> {
-      assert_eq (Http.encode_headers [("Bad:Name", "v"), ("Good", "ok")]) "Good: ok\r\n"
+      assert_eq (Http.encode_headers [
+        ("Bad:Name", "v"),
+        ("Good", "ok"),
+      ]) "Good: ok\r\n"
     })
     test "header name with whitespace is omitted" (fun () -> {
       assert_eq (Http.encode_headers [("Bad Name", "v")]) ""
@@ -136,7 +151,9 @@ tests () = {
       assert_eq (Http.encode_headers [("Bad[Name]", "v")]) ""
     })
     test "valid token chars in name are kept" (fun () -> {
-      assert_eq (Http.encode_headers [("X-Custom-1.0_a~", "v")]) "X-Custom-1.0_a~: v\r\n"
+      assert_eq (Http.encode_headers [
+        ("X-Custom-1.0_a~", "v"),
+      ]) "X-Custom-1.0_a~: v\r\n"
     })
     test "empty header name is omitted" (fun () -> {
       assert_eq (Http.encode_headers [("", "v")]) ""
@@ -196,11 +213,13 @@ tests () = {
 
   describe "decode_headers" (fun () -> {
     test "empty input (just \\r\\n) returns empty dict" (fun () -> {
-      let result = Http.decode_headers Http.default_config [] (BitString.from_string "\r\n")
+      let result =
+        Http.decode_headers Http.default_config [] (BitString.from_string "\r\n")
       assert_ok result
     })
     test "lowercases header names" (fun () -> {
-      let input = BitString.from_string "Host: example.com\r\nContent-Type: text/plain\r\n\r\n"
+      let input =
+        BitString.from_string "Host: example.com\r\nContent-Type: text/plain\r\n\r\n"
       let result = Http.decode_headers Http.default_config [] input
       case result {
         Ok (headers, _) -> {
@@ -255,7 +274,11 @@ tests () = {
       assert_eq (Http.find_header "x-trace" h) (Just "first")
     })
     test "find_all_headers returns every match in order" (fun () -> {
-      let h = [("Set-Cookie", "a=1"), ("Content-Type", "text/plain"), ("set-cookie", "b=2")]
+      let h = [
+        ("Set-Cookie", "a=1"),
+        ("Content-Type", "text/plain"),
+        ("set-cookie", "b=2"),
+      ]
       assert_eq (Http.find_all_headers "set-cookie" h) ["a=1", "b=2"]
     })
     test "replace_header drops existing entries case-insensitively" (fun () -> {
@@ -313,6 +336,40 @@ tests () = {
         }
         _ -> assert_true False
       }
+    })
+  })
+
+  describe "Server effect" (fun () -> {
+    test "collector handler captures every event in order" (fun () -> {
+      # Sanity check that the Server effect's dispatch is wired up. A
+      # collector handler builds the list by recursing through `resume`
+      # — same shape as the Chunked tests above.
+      let captured = {
+        event! (Http.AcceptError "boom")
+        event! Http.IdleTimeout
+        event! (Http.RequestParseError Http.BadRequest)
+      } with {
+        event e = {
+          let rest = resume ()
+          e :: rest
+        }
+        return _ = []
+      }
+      assert_eq (List.length captured) 3
+      case captured {
+        [Http.AcceptError "boom", Http.IdleTimeout, Http.RequestParseError Http.BadRequest] ->
+          assert_true True
+        _ -> assert_true False
+      }
+    })
+
+    test "discard_events ignores everything" (fun () -> {
+      # A no-op handler: the body completes, no events accumulated.
+      let _ = {
+        event! Http.IdleTimeout
+        event! (Http.SendFailed Http.SendChunk "closed")
+      } with Http.discard_events
+      assert_true True
     })
   })
 }

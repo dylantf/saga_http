@@ -1,14 +1,15 @@
 module IntegrationTest
 
-import Std.Actor (Process, Timer, beam_actor)
+import Std.Actor (Process, Actor, Timer, beam_actor)
 import Std.BitString
 import Std.Test (Testing, Test, describe, test, assert_true)
 import SagaHttp.Http
-import SagaHttp.Http (Chunked)
+import SagaHttp.Http (Chunked, Server, discard_events)
 import SagaHttp.Tcp
 
 val test_port = 18765
 val idle_test_port = 18766
+val events_test_port = 18767
 
 fun handle : Http.Request -> Http.Response
 handle req =
@@ -107,7 +108,7 @@ tests () = {
         ()
       })
       sleep! 200
-    } with beam_actor
+    } with { beam_actor, discard_events }
 
     test "GET returns 200 with body" (fun () -> {
       case request "GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
@@ -339,7 +340,7 @@ tests () = {
             }
           }
         }
-      } with beam_actor
+      } with { beam_actor, discard_events }
       assert_true result
     })
 
@@ -513,5 +514,53 @@ tests () = {
         Err _ -> assert_true False
       }
     })
+
+    test "Server effect: malformed request fires RequestParseError event" (fun () -> {
+      # End-to-end check that events from the spawned server actually reach
+      # the consumer. We spawn a server with a forwarding handler that
+      # `send!`s each event to the test process's mailbox, fire a malformed
+      # request, and `receive` to confirm the expected event arrives.
+      let result = {
+        let me = self! ()
+        let _ = spawn! (fun () -> {
+          let cfg = { Http.default_config | port: events_test_port }
+          let _ = Http.serve cfg handle
+          ()
+        } with {
+          beam_actor,
+          event e = {
+            send! me e
+            resume ()
+          },
+        })
+        sleep! 100
+
+        # Trigger a parse error: no valid HTTP request line.
+        let _ = case Tcp.connect "127.0.0.1" events_test_port 5000 {
+          Err _ -> ()
+          Ok sock -> {
+            let _ = Tcp.send sock (BitString.from_string "NOT_HTTP\r\n\r\n")
+            let _ = Tcp.recv sock 0 1000
+            Tcp.close sock
+          }
+        }
+
+        # The handler may emit ClientDisconnected or other events first;
+        # drain up to a few messages looking for the parse error.
+        receive_parse_error 3
+      } with beam_actor
+      assert_true result
+    })
   })
+}
+
+# Helper: drains up to `budget` messages from the mailbox, returning True
+# if any of them is a `RequestParseError BadRequest`. Has a short per-message
+# timeout so the test fails fast if no events arrive at all.
+fun receive_parse_error : Int -> Bool needs {Actor Http.ServerEvent, Timer}
+receive_parse_error 0 = False
+receive_parse_error budget = receive {
+  Http.RequestParseError Http.BadRequest -> True
+  _ -> receive_parse_error (budget - 1)
+  after 1000 -> False
 }

@@ -27,6 +27,7 @@
 - [x] Streamed response framing - strip user-provided `Content-Length` from streamed responses and emit `Transfer-Encoding: chunked`
 - [x] Connection token parsing - parse comma-separated `Connection` values case-insensitively (`close`, `keep-alive`, etc.)
 - [x] Pipelining policy enforcement - detect leftover bytes after a request and close the connection instead of dropping or accidentally processing pipelined requests
+- [x] Server-side error observability - typed `Server` effect with `ServerEvent` variants (`AcceptError`, `ClientDisconnected`, `IdleTimeout`, `RequestParseError`, `HeadersTooLarge`, `BodyReadFailed`, `SendFailed`, `PipelinedRequestDropped`); ships with `discard_events` and `print_events` default handlers
 
 ## Explicit HTTP/1.1 choices
 
@@ -48,7 +49,6 @@
 
 ## Security / robustness
 
-- [ ] Server-side error observability - introduce a typed effect (e.g. `Server` with `ServerEvent` variants for `ClientDisconnected`, `ParseError`, `AcceptError`) that the consumer handles at `serve` to log/metric/discard. Currently chunked send failures are `dbg`'d inline and parse errors are silent.
 - [ ] Graceful shutdown - stop accepting, close the listener, and drain or close active connections
 - [ ] Backpressure / connection limits - cap concurrent accepted connections and define behavior when saturated
 - [ ] Total body-read deadline - per-read timeouts exist; consider a total deadline for reading a request body

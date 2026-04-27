@@ -65,7 +65,54 @@ pub type ParseError =
   | ExpectationFailed
   deriving (Debug, Eq)
 
-type HeaderReadError = HeaderReadBadRequest | HeaderReadClosed
+# Identifies which `Tcp.send` failed inside a `SendFailed` event so consumers
+# can distinguish, say, "lost the client mid-stream" from "couldn't even
+# send the response head."
+pub type SendSite =
+  | SendResponse
+  | SendChunk
+  | SendChunkTerminator
+  | SendContinue
+  deriving (Debug, Eq)
+
+# Server-side observability events. Consumers attach a `Server` handler at
+# the `serve` boundary to log/metric/discard. Events cover the cases where
+# we previously dropped errors silently or `dbg`'d them inline.
+pub type ServerEvent =
+  | AcceptError String # accept() returned an error; loop continues
+  | ClientDisconnected # peer closed during the initial header read
+  | IdleTimeout # idle/read timeout during the header read
+  | RequestParseError ParseError # parse failed; we already sent the error response
+  | HeadersTooLarge # cumulative header cap exceeded; 400 sent
+  | BodyReadFailed String # recv failed mid-body; reason is the gen_tcp atom
+  | SendFailed SendSite String # Tcp.send returned Err at the named site
+  | PipelinedRequestDropped # leftover bytes after request; connection closed
+  deriving (Debug)
+
+pub effect Server {
+  fun event : ServerEvent -> Unit
+}
+
+# Default no-op handler. Consumers in tests and benchmarks reach for this
+# when they don't care about events.
+pub handler discard_events for Server {
+  event _ = resume ()
+}
+
+# Debug handler that prints every event via `dbg`. Useful in `Main.saga`
+# during development; not appropriate for production where structured
+# logging or a metrics export is wanted instead.
+pub handler print_events for Server {
+  event e = {
+    dbg e
+    resume ()
+  }
+}
+
+type HeaderReadError =
+  | HeaderReadBadRequest
+  | HeaderReadClosed
+  | HeaderReadTimeout
 
 pub record Config {
   port: Int,
@@ -302,8 +349,8 @@ remove_header name headers = {
   }) headers
 }
 
-fun chunked_socket : Tcp.Socket -> Handler Chunked
-chunked_socket socket = handler for Chunked {
+fun chunked_socket : Tcp.Socket -> Handler Chunked needs {Server}
+chunked_socket socket = handler for Chunked needs {Server} {
   write_chunk data = {
     let size = BitString.size data
     if size == 0 then resume ()
@@ -315,15 +362,13 @@ chunked_socket socket = handler for Chunked {
         # Don't resume — the producer's continuation is dropped, the
         # stream aborts immediately, and we don't fire `return` (no
         # point trying to send the terminator on a dead socket).
-        # TODO: route this through a server-side observability effect
-        # once we have one (see docs/planning/http1.md).
-        Err e -> dbg ("chunked send failed: ", e)
+        Err e -> event! (SendFailed SendChunk e)
       }
     }
   }
-  return _ = {
-    let _ = Tcp.send socket (BitString.from_string "0\r\n\r\n")
-    ()
+  return _ = case Tcp.send socket (BitString.from_string "0\r\n\r\n") {
+    Ok _ -> ()
+    Err e -> event! (SendFailed SendChunkTerminator e)
   }
 }
 
@@ -339,23 +384,23 @@ inject_server_headers config headers = {
 
 # Sends a response over the socket, choosing the buffered or chunked
 # wire format based on the body variant.
-pub fun send_response : Config -> Tcp.Socket -> String -> Response -> Unit
+pub fun send_response : Config -> Tcp.Socket -> String -> Response -> Unit needs {Server}
 send_response config socket method resp = {
   let headers = inject_server_headers config resp.headers
   case resp.body {
-    Buffered body -> {
-      let _ =
-        Tcp.send socket (encode_buffered_bytes method resp.status headers body)
-      ()
+    Buffered body -> case Tcp.send socket (encode_buffered_bytes method resp.status headers body) {
+      Ok _ -> ()
+      Err e -> event! (SendFailed SendResponse e)
     }
-    Streamed producer -> {
-      let _ = Tcp.send socket (encode_streamed_head resp.status headers)
-      if method == "HEAD" then ()
-      else {
-        let h = chunked_socket socket
-        let _ = producer () with h
-        ()
-      }
+    Streamed producer -> case Tcp.send socket (encode_streamed_head resp.status headers) {
+      Err e -> event! (SendFailed SendResponse e)
+      Ok _ ->
+        if method == "HEAD" then ()
+        else {
+          let h = chunked_socket socket
+          let _ = producer () with h
+          ()
+        }
     }
   }
 }
@@ -390,6 +435,7 @@ parse_version v = case v {
 # (a non-empty leftover indicates a pipelined follow-up request, which we
 # don't support — the caller should close the connection).
 pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result (Request, BitString) ParseError
+  needs {Server}
 parse_request config socket input = do {
   Ok (method, path, version_tuple, rest) <- decode_request_line input config.max_header_size
   Ok (headers, rest) <- decode_headers config [] rest
@@ -415,15 +461,17 @@ parse_request config socket input = do {
 # the server replies with `100 Continue` to signal it's willing to read the
 # body. Any other Expect value is rejected with 417. HTTP/1.0 clients don't
 # understand 100 Continue, so we ignore the header for them.
-fun maybe_send_continue : Tcp.Socket -> HttpVersion -> List (String, String) -> Result Unit ParseError
+fun maybe_send_continue : Tcp.Socket -> HttpVersion -> List (String, String) -> Result Unit ParseError needs {Server}
 maybe_send_continue socket version headers = case find_header "expect" headers {
   Nothing -> Ok ()
   Just v ->
     if String.to_lower v != "100-continue" then Err ExpectationFailed
     else case version {
       Http1_1 -> {
-        let _ =
-          Tcp.send socket (BitString.from_string "HTTP/1.1 100 Continue\r\n\r\n")
+        case Tcp.send socket (BitString.from_string "HTTP/1.1 100 Continue\r\n\r\n") {
+          Ok _ -> ()
+          Err e -> event! (SendFailed SendContinue e)
+        }
         Ok ()
       }
       Http1_0 -> Ok ()
@@ -445,6 +493,7 @@ decode_headers config acc input = case decode_header input config.max_header_siz
 # as a pipelined-request signal and close the connection (we don't
 # support pipelining — see docs/planning/http1.md).
 pub fun read_body : Config -> Tcp.Socket -> List (String, String) -> BitString -> Result (Maybe BitString, BitString) ParseError
+  needs {Server}
 read_body config socket headers rest = case validate_framing headers {
   Err e -> Err e
   Ok _ -> {
@@ -489,6 +538,7 @@ validate_framing headers = case find_all_headers "transfer-encoding" headers {
 }
 
 fun read_with_content_length : Config -> Tcp.Socket -> BitString -> String -> Result (Maybe BitString, BitString) ParseError
+  needs {Server}
 read_with_content_length config socket rest len_str = case Int.parse len_str {
   Nothing -> Err BadRequest
   # RFC 9110 §8.6: Content-Length is a non-negative integer. A negative
@@ -501,13 +551,17 @@ read_with_content_length config socket rest len_str = case Int.parse len_str {
 }
 
 fun read_content_length_bytes : Config -> Tcp.Socket -> BitString -> Int -> Result (Maybe BitString, BitString) ParseError
+  needs {Server}
 read_content_length_bytes config socket buf len =
   if BitString.size buf >= len then case buf {
     <<body:len/binary, leftover/binary>> -> Ok (Just body, leftover)
     _ -> Err BadRequest
   }
   else case Tcp.recv socket 0 config.read_timeout_ms {
-    Err _ -> Err BadRequest
+    Err reason -> {
+      event! (BodyReadFailed reason)
+      Err BadRequest
+    }
     Ok more -> read_content_length_bytes config socket (buf <> more) len
   }
 
@@ -546,6 +600,8 @@ header_section_size_at bs i =
 # `max_request_headers_size` (slowloris defense) or if a recv fails.
 # `initial_timeout` is the wait for the *first* byte (idle timeout on
 # a keep-alive connection); subsequent reads use the read timeout.
+# Distinguishes Closed (clean peer close) from Timeout so callers can
+# emit different observability events for each.
 fun read_until_headers_complete : Config -> Tcp.Socket -> BitString -> Int -> Result BitString HeaderReadError
 read_until_headers_complete config socket buf timeout = case header_section_size buf {
   Just size ->
@@ -555,7 +611,9 @@ read_until_headers_complete config socket buf timeout = case header_section_size
     if BitString.size buf
       >= config.max_request_headers_size then Err HeaderReadBadRequest
     else case Tcp.recv socket 0 timeout {
-      Err _ -> Err HeaderReadClosed
+      Err reason ->
+        if reason == "timeout" then Err HeaderReadTimeout
+        else Err HeaderReadClosed
       Ok more ->
         read_until_headers_complete config socket (buf
           <> more) config.read_timeout_ms
@@ -586,31 +644,37 @@ parse_hex_loop bs acc count = case bs {
 # Reads from the socket until `buf` contains a CRLF, returning
 # (line_without_crlf, rest_after_crlf). Bails if the line would exceed
 # `max_size`, to avoid unbounded reads on malicious input.
-fun read_line : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
+fun read_line : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError needs {Server}
 read_line socket buf max_size timeout = case find_crlf buf {
   Just split -> Ok split
   Nothing ->
     if BitString.size buf >= max_size then Err BadRequest
     else case Tcp.recv socket 0 timeout {
-      Err _ -> Err BadRequest
+      Err reason -> {
+        event! (BodyReadFailed reason)
+        Err BadRequest
+      }
       Ok more -> read_line socket (buf <> more) max_size timeout
     }
 }
 
 # Ensures `buf` contains at least `n` bytes, returning (first_n, rest).
-fun read_n : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
+fun read_n : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError needs {Server}
 read_n socket buf n timeout =
   if BitString.size buf >= n then case buf {
     <<first:n/binary, rest/binary>> -> Ok (first, rest)
     _ -> Err BadRequest
   }
   else case Tcp.recv socket (n - BitString.size buf) timeout {
-    Err _ -> Err BadRequest
+    Err reason -> {
+      event! (BodyReadFailed reason)
+      Err BadRequest
+    }
     Ok more -> read_n socket (buf <> more) n timeout
   }
 
 # Discards trailer headers up to and including the terminating empty line.
-fun consume_trailers : Config -> Tcp.Socket -> BitString -> Result BitString ParseError
+fun consume_trailers : Config -> Tcp.Socket -> BitString -> Result BitString ParseError needs {Server}
 consume_trailers config socket buf = case read_line socket buf config.max_trailer_size config.read_timeout_ms {
   Err e -> Err e
   Ok (line, rest) ->
@@ -618,7 +682,7 @@ consume_trailers config socket buf = case read_line socket buf config.max_traile
     else consume_trailers config socket rest
 }
 
-fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError
+fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError needs {Server}
 read_chunked config socket buf acc = case read_line socket buf config.max_chunk_line_size config.read_timeout_ms {
   Err e -> Err e
   Ok (line, after_size) -> case parse_chunk_size line {
@@ -627,7 +691,7 @@ read_chunked config socket buf acc = case read_line socket buf config.max_chunk_
   }
 }
 
-fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError
+fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError needs {Server}
 read_chunk_body config socket buf acc 0 = case consume_trailers config socket buf {
   Err e -> Err e
   Ok rest -> Ok (acc, rest)
@@ -675,30 +739,42 @@ connection_tokens v =
 
 # Reads requests in a loop until the client disconnects, times out,
 # or the connection should close.
-pub fun handle_connection : Config -> Tcp.Socket -> (Request -> Response) -> Unit
+pub fun handle_connection : Config -> Tcp.Socket -> (Request -> Response) -> Unit needs {Server}
 handle_connection config socket on_request = case read_until_headers_complete config socket <<>> config.idle_timeout_ms {
-  Err HeaderReadClosed -> Tcp.close socket
+  Err HeaderReadClosed -> {
+    event! ClientDisconnected
+    Tcp.close socket
+  }
+  Err HeaderReadTimeout -> {
+    event! IdleTimeout
+    Tcp.close socket
+  }
   Err HeaderReadBadRequest -> {
-    let _ = send_response config socket "GET" bad_request
+    event! HeadersTooLarge
+    send_response config socket "GET" bad_request
     Tcp.close socket
   }
   Ok data -> case parse_request config socket data {
     Err err -> {
+      event! (RequestParseError err)
       let resp = case err {
         BadRequest -> bad_request
         PayloadTooLarge -> payload_too_large
         ExpectationFailed -> expectation_failed
       }
-      let _ = send_response config socket "GET" resp
+      send_response config socket "GET" resp
       Tcp.close socket
     }
     Ok (req, leftover) -> {
       let resp = on_request req
-      let _ = send_response config socket req.method resp
+      send_response config socket req.method resp
       # If anything remains in the buffer after the body, the client
       # pipelined a follow-up request. We don't support pipelining,
       # so close rather than letting the bytes hang the connection.
-      if BitString.size leftover > 0 then Tcp.close socket
+      if BitString.size leftover > 0 then {
+        event! PipelinedRequestDropped
+        Tcp.close socket
+      }
       else if should_keep_alive req then handle_connection config socket on_request
       else Tcp.close socket
     }
@@ -706,19 +782,22 @@ handle_connection config socket on_request = case read_until_headers_complete co
 }
 
 fun accept_loop : Config -> Tcp.ListenSocket -> (Request -> Response) -> Unit
-  needs {Process}
+  needs {Process, Server}
 accept_loop config listener on_request = {
   case Tcp.accept listener {
     Ok socket -> {
       let _ = spawn! (fun () -> handle_connection config socket on_request)
       accept_loop config listener on_request
     }
-    Err _ -> accept_loop config listener on_request
+    Err e -> {
+      event! (AcceptError e)
+      accept_loop config listener on_request
+    }
   }
 }
 
 pub fun serve : Config -> (Request -> Response) -> Result Unit String
-  needs {Process}
+  needs {Process, Server}
 serve config on_request = do {
   Ok listener <- Tcp.listen config.port 1024
   Ok (accept_loop config listener on_request)

@@ -2,7 +2,14 @@ module Main
 
 import Std.Actor (beam_actor)
 import Std.BitString
-import SagaHttp.Http (serve, default_config, text, Request, Response)
+import SagaHttp.Http (
+  serve,
+  default_config,
+  text,
+  Request,
+  Response,
+  print_events,
+)
 
 fun handle : Request -> Response
 handle req = case req.body {
@@ -15,4 +22,4 @@ handle req = case req.body {
 
 main () = {
   serve default_config handle
-} with beam_actor
+} with { beam_actor, print_events }
