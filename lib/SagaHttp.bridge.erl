@@ -11,6 +11,7 @@
     decode_header/2,
     setopts/2,
     peername/1,
+    controlling_process/2,
     current_http_date/0
 ]).
 
@@ -115,6 +116,15 @@ peername(Socket) ->
             {ok, {AddrStr, Port}};
         {error, Reason} ->
             {error, atom_to_binary(Reason)}
+    end.
+
+%% Transfer ownership of a socket (or listen socket) to another process.
+%% Used by `serve` to hand the listener to the supervisor process so the
+%% listener outlives `serve`'s caller.
+controlling_process(Socket, Pid) ->
+    case gen_tcp:controlling_process(Socket, Pid) of
+        ok -> {ok, unit};
+        {error, Reason} -> {error, atom_to_binary(Reason)}
     end.
 
 %% IMF-fixdate per RFC 7231 §7.1.1.1, e.g. "Sun, 06 Nov 1994 08:49:37 GMT".

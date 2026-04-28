@@ -1,8 +1,8 @@
 module IntegrationTest
 
-import Std.Actor (Process, Actor, Timer, beam_actor)
+import Std.Actor (Process, Actor, Monitor, Timer, beam_actor)
 import Std.BitString
-import Std.Test (Testing, Test, describe, test, assert_true)
+import Std.Test (Testing, Test, describe, test, assert_true, assert_eq)
 import SagaHttp.Http
 import SagaHttp.Http (Chunked, Server, discard_events)
 import SagaHttp.Tcp
@@ -10,6 +10,9 @@ import SagaHttp.Tcp
 val test_port = 18765
 val idle_test_port = 18766
 val events_test_port = 18767
+val shutdown_test_port = 18768
+val shutdown_drain_port = 18769
+val shutdown_timeout_port = 18770
 
 fun handle : Http.Request -> Http.Response
 handle req =
@@ -550,6 +553,98 @@ tests () = {
         receive_parse_error 3
       } with beam_actor
       assert_true result
+    })
+
+    test "shutdown_and_wait returns Drained when no connections are active" (fun () -> {
+      # Idle server: shutdown should complete instantly with Drained.
+      let result = {
+        let cfg = { Http.default_config | port: shutdown_test_port }
+        case Http.serve cfg handle {
+          Err _ -> Http.NoReply
+          Ok h -> {
+            sleep! 50  # let the supervisor settle
+            Http.shutdown_and_wait h 1000
+          }
+        }
+      } with { beam_actor, discard_events }
+      assert_eq result Http.Drained
+    })
+
+    test "shutdown drains an idle keep-alive connection without waiting for idle timeout" (fun () -> {
+      # The original concern that motivated `shutdown` design: an idle
+      # keep-alive connection should NOT extend shutdown by its full
+      # `idle_timeout_ms`. Force-closing tracked sockets makes drainage
+      # essentially instant.
+      let result = {
+        let cfg = { Http.default_config | port: shutdown_timeout_port }
+        case Http.serve cfg handle {
+          Err _ -> Http.NoReply
+          Ok h -> {
+            sleep! 50
+
+            case Tcp.connect "127.0.0.1" shutdown_timeout_port 5000 {
+              Err _ -> Http.NoReply
+              Ok sock -> {
+                # Send a complete request, read the response, leave the
+                # socket open. The connection process is now in its
+                # 30s idle keep-alive wait. With force-close on shutdown
+                # we should still drain quickly.
+                let _ = Tcp.send sock (BitString.from_string
+                  "GET /hold HTTP/1.1\r\nHost: x\r\n\r\n")
+                let _ = Tcp.recv sock 0 1000
+
+                # 200ms deadline. Without force-close this would TimedOut.
+                let s = Http.shutdown_and_wait h 200
+                let _ = Tcp.close sock
+                s
+              }
+            }
+          }
+        }
+      } with { beam_actor, discard_events }
+      assert_eq result Http.Drained
+    })
+
+    test "shutdown_and_wait drains an in-flight request" (fun () -> {
+      # Open a connection and send a request, then start shutdown while the
+      # request is being handled. The server should still respond to the
+      # in-flight request, then return Drained.
+      let result = {
+        let cfg = { Http.default_config | port: shutdown_drain_port }
+        case Http.serve cfg handle {
+          Err _ -> (Http.NoReply, "no-server")
+          Ok h -> {
+            sleep! 50
+
+            # Open a long-lived keep-alive connection that has just sent a
+            # request. The handler will respond immediately, but the
+            # connection process stays alive in idle-keepalive until the
+            # server shuts it down.
+            let resp = case Tcp.connect "127.0.0.1" shutdown_drain_port 5000 {
+              Err _ -> Err "connect"
+              Ok sock -> {
+                let _ = Tcp.send sock (BitString.from_string
+                  "GET /drain HTTP/1.1\r\nHost: x\r\n\r\n")
+                let r = Tcp.recv sock 0 1000
+                let _ = Tcp.close sock
+                case r {
+                  Ok bs -> Ok (resp_to_string bs)
+                  Err e -> Err e
+                }
+              }
+            }
+
+            # Even though the connection is idle keep-alive, shutdown should
+            # close the listener, then drain the existing connection process
+            # (which exits when the client closed its socket above).
+            let s = Http.shutdown_and_wait h 2000
+            (s, case resp { Ok r -> r; Err _ -> "no-resp" })
+          }
+        }
+      } with { beam_actor, discard_events }
+      let (status, body) = result
+      assert_eq status Http.Drained
+      assert_contains "path: /drain" body
     })
   })
 }

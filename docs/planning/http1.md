@@ -27,7 +27,8 @@
 - [x] Streamed response framing - strip user-provided `Content-Length` from streamed responses and emit `Transfer-Encoding: chunked`
 - [x] Connection token parsing - parse comma-separated `Connection` values case-insensitively (`close`, `keep-alive`, etc.)
 - [x] Pipelining policy enforcement - detect leftover bytes after a request and close the connection instead of dropping or accidentally processing pipelined requests
-- [x] Server-side error observability - typed `Server` effect with `ServerEvent` variants (`AcceptError`, `ClientDisconnected`, `IdleTimeout`, `RequestParseError`, `HeadersTooLarge`, `BodyReadFailed`, `SendFailed`, `PipelinedRequestDropped`); ships with `discard_events` and `print_events` default handlers
+- [x] Server-side error observability - typed `Server` effect with `ServerEvent` variants (`AcceptError`, `ClientDisconnected`, `IdleTimeout`, `RequestParseError`, `HeadersTooLarge`, `BodyReadFailed`, `SendFailed`, `PipelinedRequestDropped`, `ShutdownTimedOut`); ships with `discard_events` and `print_events` default handlers
+- [x] Graceful shutdown - `serve` returns a `ShutdownHandle` after spawning a supervisor + acceptor; `shutdown_and_wait handle deadline_ms` closes the listener, force-closes all tracked connection sockets so blocked recvs (idle keep-alive, mid-headers, mid-body) wake immediately, drains via `Monitor`, and returns `Drained` / `TimedOut` / `NoReply`. `await_shutdown handle` blocks until the supervisor exits (used by `Main.saga` to keep the executable alive). Trade-off: requests that are mid-response when shutdown is triggered get a truncated response.
 
 ## Explicit HTTP/1.1 choices
 
@@ -49,7 +50,6 @@
 
 ## Security / robustness
 
-- [ ] Graceful shutdown - stop accepting, close the listener, and drain or close active connections
 - [ ] Backpressure / connection limits - cap concurrent accepted connections and define behavior when saturated
 - [ ] Total body-read deadline - per-read timeouts exist; consider a total deadline for reading a request body
 - [ ] Public-internet hardening pass - review request smuggling, malformed chunk extensions, odd whitespace, absolute-form targets, and proxy-facing behavior

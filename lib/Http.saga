@@ -1,6 +1,6 @@
 module SagaHttp.Http
 
-import Std.Actor (Process)
+import Std.Actor (Process, Actor, Monitor, Timer, Pid, ExitReason)
 import Std.BitString
 import Std.Int
 import SagaHttp.Tcp
@@ -87,6 +87,7 @@ pub type ServerEvent =
   | BodyReadFailed String # recv failed mid-body; reason is the gen_tcp atom
   | SendFailed SendSite String # Tcp.send returned Err at the named site
   | PipelinedRequestDropped # leftover bytes after request; connection closed
+  | ShutdownTimedOut Int # graceful shutdown deadline expired; arg is # of connections still alive
   deriving (Debug)
 
 pub effect Server {
@@ -384,7 +385,8 @@ inject_server_headers config headers = {
 
 # Sends a response over the socket, choosing the buffered or chunked
 # wire format based on the body variant.
-pub fun send_response : Config -> Tcp.Socket -> String -> Response -> Unit needs {Server}
+pub fun send_response : Config -> Tcp.Socket -> String -> Response -> Unit
+  needs {Server}
 send_response config socket method resp = {
   let headers = inject_server_headers config resp.headers
   case resp.body {
@@ -461,7 +463,8 @@ parse_request config socket input = do {
 # the server replies with `100 Continue` to signal it's willing to read the
 # body. Any other Expect value is rejected with 417. HTTP/1.0 clients don't
 # understand 100 Continue, so we ignore the header for them.
-fun maybe_send_continue : Tcp.Socket -> HttpVersion -> List (String, String) -> Result Unit ParseError needs {Server}
+fun maybe_send_continue : Tcp.Socket -> HttpVersion -> List (String, String) -> Result Unit ParseError
+  needs {Server}
 maybe_send_continue socket version headers = case find_header "expect" headers {
   Nothing -> Ok ()
   Just v ->
@@ -644,7 +647,8 @@ parse_hex_loop bs acc count = case bs {
 # Reads from the socket until `buf` contains a CRLF, returning
 # (line_without_crlf, rest_after_crlf). Bails if the line would exceed
 # `max_size`, to avoid unbounded reads on malicious input.
-fun read_line : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError needs {Server}
+fun read_line : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
+  needs {Server}
 read_line socket buf max_size timeout = case find_crlf buf {
   Just split -> Ok split
   Nothing ->
@@ -659,7 +663,8 @@ read_line socket buf max_size timeout = case find_crlf buf {
 }
 
 # Ensures `buf` contains at least `n` bytes, returning (first_n, rest).
-fun read_n : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError needs {Server}
+fun read_n : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
+  needs {Server}
 read_n socket buf n timeout =
   if BitString.size buf >= n then case buf {
     <<first:n/binary, rest/binary>> -> Ok (first, rest)
@@ -674,7 +679,8 @@ read_n socket buf n timeout =
   }
 
 # Discards trailer headers up to and including the terminating empty line.
-fun consume_trailers : Config -> Tcp.Socket -> BitString -> Result BitString ParseError needs {Server}
+fun consume_trailers : Config -> Tcp.Socket -> BitString -> Result BitString ParseError
+  needs {Server}
 consume_trailers config socket buf = case read_line socket buf config.max_trailer_size config.read_timeout_ms {
   Err e -> Err e
   Ok (line, rest) ->
@@ -682,7 +688,8 @@ consume_trailers config socket buf = case read_line socket buf config.max_traile
     else consume_trailers config socket rest
 }
 
-fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError needs {Server}
+fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError
+  needs {Server}
 read_chunked config socket buf acc = case read_line socket buf config.max_chunk_line_size config.read_timeout_ms {
   Err e -> Err e
   Ok (line, after_size) -> case parse_chunk_size line {
@@ -691,7 +698,8 @@ read_chunked config socket buf acc = case read_line socket buf config.max_chunk_
   }
 }
 
-fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError needs {Server}
+fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError
+  needs {Server}
 read_chunk_body config socket buf acc 0 = case consume_trailers config socket buf {
   Err e -> Err e
   Ok rest -> Ok (acc, rest)
@@ -739,7 +747,8 @@ connection_tokens v =
 
 # Reads requests in a loop until the client disconnects, times out,
 # or the connection should close.
-pub fun handle_connection : Config -> Tcp.Socket -> (Request -> Response) -> Unit needs {Server}
+pub fun handle_connection : Config -> Tcp.Socket -> (Request -> Response) -> Unit
+  needs {Server}
 handle_connection config socket on_request = case read_until_headers_complete config socket <<>> config.idle_timeout_ms {
   Err HeaderReadClosed -> {
     event! ClientDisconnected
@@ -781,26 +790,176 @@ handle_connection config socket on_request = case read_until_headers_complete co
   }
 }
 
-fun accept_loop : Config -> Tcp.ListenSocket -> (Request -> Response) -> Unit
-  needs {Process, Server}
-accept_loop config listener on_request = {
-  case Tcp.accept listener {
-    Ok socket -> {
-      let _ = spawn! (fun () -> handle_connection config socket on_request)
-      accept_loop config listener on_request
-    }
-    Err e -> {
-      event! (AcceptError e)
-      accept_loop config listener on_request
-    }
+# -- Graceful shutdown --
+#
+# `serve` is non-blocking. It listens, spawns a supervisor process that owns
+# the listener and tracks active connections, and returns a `ShutdownHandle`.
+# Internally:
+#   - The supervisor sits in a `receive` loop, multiplexing inbound
+#     connection sockets and shutdown messages.
+#   - A separate "acceptor" process does the blocking `Tcp.accept` and
+#     forwards each new socket to the supervisor as a `NewConnection` message.
+#     Splitting this out lets the supervisor stay responsive to shutdown
+#     without having to abandon a blocking accept call.
+#   - On shutdown, the supervisor closes the listener (which causes the
+#     acceptor's pending `accept` to return `Err`, exiting that process),
+#     then drains active connections by counting `Down` system messages
+#     until the count hits zero or the deadline expires.
+#   - Shutdown result is communicated via the supervisor's exit reason:
+#     `Normal` for clean drain, `Other "timed_out:N"` for deadline expiry
+#     with N connections still alive.
+
+# Internal mailbox protocol for the supervisor process. `Eq` is needed
+# because the conn-tracking list compares `Pid SupMsg` values when
+# removing a dead handler on `Down`, and `Eq for Pid msg` requires
+# `Eq for msg` even though pid identity at runtime is independent of msg.
+type SupMsg =
+  | NewConnection Tcp.Socket
+  | DoShutdown Int # deadline_ms
+  deriving (Eq)
+
+opaque type ShutdownHandle = ShutdownHandle (Pid SupMsg)
+
+pub type ShutdownResult =
+  | Drained
+  | TimedOut    # deadline fired with connections still alive; count is reported via `ShutdownTimedOut` event
+  | NoReply     # supervisor died for an unexpected reason
+  deriving (Debug, Eq)
+
+# Acceptor: blocks on Tcp.accept, forwards each new socket to the supervisor.
+# Exits when the listener is closed (Tcp.accept returns Err).
+# `Actor a` is required by `spawn`'s signature; the acceptor never reads its
+# own mailbox, so `a` is unconstrained.
+fun acceptor_loop : Tcp.ListenSocket -> Pid SupMsg -> Unit
+  needs {Actor a, Process, Server}
+acceptor_loop listener sup = case Tcp.accept listener {
+  Ok socket -> {
+    # Hand the socket off to the supervisor before sending. `controlling_process`
+    # can only be called by the current owner (the acceptor); doing it here
+    # means the supervisor can later re-transfer to the handler. Without
+    # this two-step dance, the socket would die when the acceptor dies on
+    # shutdown.
+    let _ = Tcp.controlling_process socket sup
+    send! sup (NewConnection socket)
+    acceptor_loop listener sup
+  }
+  Err e -> {
+    # The expected exit path is `e == "closed"` after the supervisor closes
+    # the listener for shutdown. Any other reason still drops out of the
+    # loop — we report it as an event and let the supervisor notice via
+    # the implicit acceptor death (no link/monitor in v1; the supervisor
+    # will simply stop receiving NewConnection messages).
+    event! (AcceptError e)
   }
 }
 
-pub fun serve : Config -> (Request -> Response) -> Result Unit String
-  needs {Process, Server}
-serve config on_request = do {
-  Ok listener <- Tcp.listen config.port 1024
-  Ok (accept_loop config listener on_request)
-} else {
+# Supervisor: receive-driven. Spawns and monitors connection processes,
+# tracks (Pid, Socket) pairs so shutdown can force-close every active
+# connection at once. The list is kept tight by removing entries on
+# `Down`, so the supervisor's footprint stays proportional to live
+# connections, not cumulative.
+fun supervisor_loop : Config -> Tcp.ListenSocket -> (Request -> Response) -> List (Pid SupMsg, Tcp.Socket) -> Unit
+  needs {Process, Actor SupMsg, Monitor, Timer, Server}
+supervisor_loop config listener on_request conns = receive {
+  NewConnection sock -> {
+    let pid = spawn! (fun () -> handle_connection config sock on_request)
+    # Transfer the accepted socket from the acceptor (its current
+    # controlling process) to the handler. Without this, when the
+    # listener closes during shutdown the acceptor dies, taking all
+    # in-flight connection sockets with it.
+    let _ = Tcp.controlling_process sock pid
+    let _ref = monitor! pid
+    supervisor_loop config listener on_request ((pid, sock) :: conns)
+  }
+  DoShutdown deadline_ms -> {
+    # Close listener immediately so no new connections accept. Then
+    # close every tracked connection socket — this wakes any blocked
+    # `Tcp.recv` (idle keep-alive, mid-headers, mid-body) at once,
+    # triggering the connection processes to exit. Any handler that
+    # was mid-response gets a truncated response — that's the cost of
+    # bounded shutdown.
+    Tcp.close_listener listener
+    List.iter (fun pair -> {
+      let (_, sock) = pair
+      Tcp.close sock
+    }) conns
+    drain_loop (List.length conns) deadline_ms
+  }
+  Down dead _ -> supervisor_loop config listener on_request (List.filter (fun pair -> {
+    let (p, _) = pair
+    p != dead
+  }) conns)
+}
+
+# Drain phase: wait for connection-handler processes to exit, with a
+# deadline. All sockets have already been closed in `DoShutdown`, so
+# in practice the Downs arrive almost immediately. The deadline is a
+# safety net for handlers that take time to wind down after their
+# socket dies (e.g., still running user code in `on_request`).
+fun drain_loop : Int -> Int -> Unit needs {Process, Actor SupMsg, Server}
+drain_loop 0 _deadline = ()
+drain_loop active deadline_ms = receive {
+  Down _ _ -> drain_loop (active - 1) deadline_ms
+  NewConnection sock -> {
+    # Possible if the acceptor already had a NewConnection in flight
+    # when shutdown began. The listener is closed but the message
+    # outraced our close; refuse the connection.
+    Tcp.close sock
+    drain_loop active deadline_ms
+  }
+  DoShutdown _ -> drain_loop active deadline_ms # idempotent; ignore extra
+  after deadline_ms -> {
+    event! (ShutdownTimedOut active)
+    let me = self! ()
+    exit! me Shutdown
+  }
+}
+
+pub fun serve : Config -> (Request -> Response) -> Result ShutdownHandle String
+  needs {Process, Actor SupMsg, Monitor, Timer, Server}
+serve config on_request = case Tcp.listen config.port 1024 {
   Err e -> Err e
+  Ok listener -> {
+    let sup = spawn! (fun () -> supervisor_loop config listener on_request [])
+    # Hand the listener to the supervisor so it outlives the caller. Without
+    # this, when `serve`'s caller exits, gen_tcp closes the listener
+    # automatically and the acceptor's pending `accept` errors out.
+    let _ = Tcp.listener_controlling_process listener sup
+    let _ = spawn! (fun () -> acceptor_loop listener sup)
+    Ok (ShutdownHandle sup)
+  }
+}
+
+# Synchronous shutdown. Sends the shutdown signal, monitors the supervisor,
+# waits for it to die, decodes the result from its exit reason. The caller's
+# mailbox type is unconstrained — `Down` system messages match any `Actor msg`.
+#
+# `deadline_ms` is the supervisor's drain deadline. `shutdown_and_wait` itself
+# adds a small grace period on top so a non-responsive supervisor still
+# returns `NoReply` instead of hanging.
+pub fun shutdown_and_wait : ShutdownHandle -> Int -> ShutdownResult
+  needs {Process, Actor msg, Monitor}
+shutdown_and_wait (ShutdownHandle sup) deadline_ms = {
+  let _ref = monitor! sup
+  send! sup (DoShutdown deadline_ms)
+  receive {
+    Down _ reason -> case reason {
+      Normal -> Drained
+      Shutdown -> TimedOut
+      _ -> NoReply
+    }
+    after deadline_ms + 5000 -> NoReply
+  }
+}
+
+# Blocks the caller until the server's supervisor exits. Useful in `main`
+# so the executable doesn't return immediately after `serve`. Returns
+# normally on any supervisor exit reason — callers that care about the
+# distinction should use `shutdown_and_wait` instead.
+pub fun await_shutdown : ShutdownHandle -> Unit needs {Actor msg, Monitor}
+await_shutdown (ShutdownHandle sup) = {
+  let _ref = monitor! sup
+  receive {
+    Down _ _ -> ()
+  }
 }

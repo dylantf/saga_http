@@ -1,5 +1,7 @@
 module SagaHttp.Tcp
 
+import Std.Actor (Pid)
+
 opaque type Socket = Socket
 opaque type ListenSocket = ListenSocket
 
@@ -24,5 +26,28 @@ pub fun send : (socket: Socket) -> (data: BitString) -> Result Unit String
 @external("erlang", "SagaHttp.bridge", "close")
 pub fun close : (socket: Socket) -> Unit
 
+# Same backend as `close`. Exposed separately so the type system distinguishes
+# closing an accepted connection from closing the listening socket itself
+# (the latter unblocks `accept` callers with an error, which is how graceful
+# shutdown stops accepting new connections).
+@external("erlang", "SagaHttp.bridge", "close")
+pub fun close_listener : (socket: ListenSocket) -> Unit
+
 @external("erlang", "SagaHttp.bridge", "peername")
 pub fun peername : (socket: Socket) -> Result (String, Int) String
+
+# Transfer ownership of a listening socket to another process. Required
+# when the listener was created by a short-lived process and we want it
+# to keep accepting after that process exits — without transfer, the
+# listener is closed automatically when its creator dies.
+@external("erlang", "SagaHttp.bridge", "controlling_process")
+pub fun listener_controlling_process : (socket: ListenSocket) -> (pid: Pid msg) -> Result Unit String
+
+# Transfer ownership of an accepted connection socket. Same reason as the
+# listener variant: an accepted socket's controlling process is whoever
+# called `accept`, and the kernel closes the socket when that process dies.
+# To let connections outlive the acceptor (so a graceful shutdown can close
+# the listener without dropping in-flight requests), transfer to the
+# connection-handler process before the acceptor exits.
+@external("erlang", "SagaHttp.bridge", "controlling_process")
+pub fun controlling_process : (socket: Socket) -> (pid: Pid msg) -> Result Unit String

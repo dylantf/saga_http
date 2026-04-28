@@ -4,6 +4,7 @@ import Std.Actor (beam_actor)
 import Std.BitString
 import SagaHttp.Http (
   serve,
+  await_shutdown,
   default_config,
   text,
   Request,
@@ -21,5 +22,11 @@ handle req = case req.body {
 }
 
 main () = {
-  serve default_config handle
-} with { beam_actor, print_events }
+  case serve default_config handle {
+    Err e -> dbg ("startup failed", e)
+    Ok handle -> {
+      dbg ("listening on port", default_config.port)
+      await_shutdown handle
+    }
+  }
+} with {beam_actor, print_events}
