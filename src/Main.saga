@@ -1,15 +1,19 @@
 module Main
 
-import Std.Actor (beam_actor)
+import Std.Actor (Process, beam_actor)
 import Std.BitString
+import Std.Process (Signal, beam_signal, SigTerm, exit)
 import SagaHttp.Http (
   serve,
-  await_shutdown,
+  shutdown_and_wait,
   default_config,
   text,
   Request,
   Response,
   print_events,
+  Drained,
+  TimedOut,
+  NoReply,
 )
 
 fun handle : Request -> Response
@@ -26,7 +30,29 @@ main () = {
     Err e -> dbg ("startup failed", e)
     Ok handle -> {
       dbg ("listening on port", default_config.port)
-      await_shutdown handle
+
+      # First SIGTERM: begin graceful drain. (Ctrl-C goes to the BEAM
+      # break handler, not to us; for a kill from the shell, use
+      # `kill -TERM <pid>` or any orchestrator that sends SIGTERM —
+      # systemd, Docker stop, k8s pod termination all do.)
+      await_signal! SigTerm
+      dbg "received SIGTERM, draining (deadline 30s)"
+
+      # Watch for a second signal during drain. If it comes, hard-exit
+      # the VM. Spawned because the drain in the main process is
+      # synchronous, so the main process can't wait on a second signal
+      # itself.
+      let _watcher = spawn! (fun () -> {
+        await_signal! SigTerm
+        dbg "received second SIGTERM, force-exiting"
+        exit 1
+      })
+
+      case shutdown_and_wait handle 30000 {
+        Drained -> dbg "drained cleanly"
+        TimedOut -> dbg "drain deadline hit; some connections still alive"
+        NoReply -> dbg "supervisor died unexpectedly"
+      }
     }
   }
-} with {beam_actor, print_events}
+} with {beam_actor, beam_signal, print_events}
