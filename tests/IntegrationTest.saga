@@ -222,6 +222,16 @@ tests () = {
       }
     })
 
+    test "chunked trailers are capped cumulatively" (fun () -> {
+      let trailers = String.repeat 5000 "X: y\r\n"
+      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        <> $"5\r\nhello\r\n0\r\n{trailers}\r\n"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
     test "Transfer-Encoding + Content-Length together returns 400" (fun () -> {
       let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
         <> "5\r\nhello\r\n0\r\n\r\n"
@@ -259,8 +269,21 @@ tests () = {
       case request req {
         Ok r -> {
           # No interim response — straight to 200
-          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "HTTP/1.0 200 OK" r
           assert_contains "echo: hello" r
+          if String.contains "100 Continue" r then assert_true False
+          else assert_true True
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "Expect: 100-continue is not sent before rejecting oversized Content-Length" (fun () -> {
+      let req =
+        "POST /huge HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n"
+      case request req {
+        Ok r -> {
+          assert_contains "HTTP/1.1 413 Payload Too Large" r
           if String.contains "100 Continue" r then assert_true False
           else assert_true True
         }

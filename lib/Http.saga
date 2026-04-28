@@ -86,6 +86,7 @@ pub type ServerEvent =
   | HeadersTooLarge # cumulative header cap exceeded; 400 sent
   | BodyReadFailed String # recv failed mid-body; reason is the gen_tcp atom
   | SendFailed SendSite String # Tcp.send returned Err at the named site
+  | OwnershipTransferFailed String # gen_tcp:controlling_process failed
   | PipelinedRequestDropped # leftover bytes after request; connection closed
   | ShutdownTimedOut Int # graceful shutdown deadline expired; arg is # of connections still alive
   deriving (Debug)
@@ -311,16 +312,23 @@ encode_headers headers =
 # Panics if called with a Streamed response — use send_response instead.
 pub fun encode_response : (method: String) -> Response -> BitString
 encode_response method resp = case resp.body {
-  Buffered body -> encode_buffered_bytes method resp.status resp.headers body
+  Buffered body ->
+    encode_buffered_bytes Http1_1 method resp.status resp.headers body
   Streamed _ ->
     panic "encode_response: cannot encode a Streamed response, use send_response"
 }
 
-fun encode_buffered_bytes : String -> Int -> List (String, String) -> String -> BitString
-encode_buffered_bytes method status headers body = {
+fun response_version_text : HttpVersion -> String
+response_version_text version = case version {
+  Http1_0 -> "HTTP/1.0"
+  Http1_1 -> "HTTP/1.1"
+}
+
+fun encode_buffered_bytes : HttpVersion -> String -> Int -> List (String, String) -> String -> BitString
+encode_buffered_bytes version method status headers body = {
   let body_len = show (String.byte_size body)
   let headers = replace_header "Content-Length" body_len headers
-  let head = $"HTTP/1.1 {show status} {status_text status}\r\n"
+  let head = $"{response_version_text version} {show status} {status_text status}\r\n"
     <> encode_headers headers
     <> "\r\n"
   let head_bits = BitString.from_string head
@@ -328,14 +336,14 @@ encode_buffered_bytes method status headers body = {
   else head_bits <> BitString.from_string body
 }
 
-fun encode_streamed_head : Int -> List (String, String) -> BitString
-encode_streamed_head status headers = {
+fun encode_streamed_head : HttpVersion -> Int -> List (String, String) -> BitString
+encode_streamed_head version status headers = {
   # A streamed response is framed by Transfer-Encoding: chunked alone;
   # mixing in a Content-Length is a protocol violation that confuses
   # clients/proxies, so drop any user-supplied one before emitting.
   let no_cl = remove_header "Content-Length" headers
   let with_te = replace_header "Transfer-Encoding" "chunked" no_cl
-  BitString.from_string ($"HTTP/1.1 {show status} {status_text status}\r\n"
+  BitString.from_string ($"{response_version_text version} {show status} {status_text status}\r\n"
     <> encode_headers with_te
     <> "\r\n")
 }
@@ -385,16 +393,16 @@ inject_server_headers config headers = {
 
 # Sends a response over the socket, choosing the buffered or chunked
 # wire format based on the body variant.
-pub fun send_response : Config -> Tcp.Socket -> String -> Response -> Unit
+pub fun send_response : Config -> Tcp.Socket -> HttpVersion -> String -> Response -> Unit
   needs {Server}
-send_response config socket method resp = {
+send_response config socket version method resp = {
   let headers = inject_server_headers config resp.headers
   case resp.body {
-    Buffered body -> case Tcp.send socket (encode_buffered_bytes method resp.status headers body) {
+    Buffered body -> case Tcp.send socket (encode_buffered_bytes version method resp.status headers body) {
       Ok _ -> ()
       Err e -> event! (SendFailed SendResponse e)
     }
-    Streamed producer -> case Tcp.send socket (encode_streamed_head resp.status headers) {
+    Streamed producer -> case Tcp.send socket (encode_streamed_head version resp.status headers) {
       Err e -> event! (SendFailed SendResponse e)
       Ok _ ->
         if method == "HEAD" then ()
@@ -441,6 +449,7 @@ pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result (Request, Bi
 parse_request config socket input = do {
   Ok (method, path, version_tuple, rest) <- decode_request_line input config.max_header_size
   Ok (headers, rest) <- decode_headers config [] rest
+  Ok _ <- validate_body_framing config headers
   Ok _ <- maybe_send_continue socket (parse_version version_tuple) headers
   Ok (body, leftover) <- read_body config socket headers rest
   Ok (
@@ -519,6 +528,36 @@ read_body config socket headers rest = case validate_framing headers {
       Nothing -> case cl {
         Nothing -> Ok (Nothing, rest)
         Just len_str -> read_with_content_length config socket rest len_str
+      }
+    }
+  }
+}
+
+fun validate_body_framing : Config -> List (String, String) -> Result Unit ParseError
+validate_body_framing config headers = case validate_framing headers {
+  Err e -> Err e
+  Ok _ -> {
+    let te = case find_header "transfer-encoding" headers {
+      Just v -> Just (String.to_lower v)
+      Nothing -> Nothing
+    }
+    let cl = find_header "content-length" headers
+    case te {
+      Just te_val ->
+        if te_val != "chunked" then Err BadRequest
+        else case cl {
+          Just _ -> Err BadRequest
+          Nothing -> Ok ()
+        }
+      Nothing -> case cl {
+        Nothing -> Ok ()
+        Just len_str -> case Int.parse len_str {
+          Nothing -> Err BadRequest
+          Just len when len < 0 -> Err BadRequest
+          Just len ->
+            if len > config.max_body_size then Err PayloadTooLarge
+            else Ok ()
+        }
       }
     }
   }
@@ -681,11 +720,19 @@ read_n socket buf n timeout =
 # Discards trailer headers up to and including the terminating empty line.
 fun consume_trailers : Config -> Tcp.Socket -> BitString -> Result BitString ParseError
   needs {Server}
-consume_trailers config socket buf = case read_line socket buf config.max_trailer_size config.read_timeout_ms {
+consume_trailers config socket buf = consume_trailers_loop config socket buf 0
+
+fun consume_trailers_loop : Config -> Tcp.Socket -> BitString -> Int -> Result BitString ParseError
+  needs {Server}
+consume_trailers_loop config socket buf used = case read_line socket buf config.max_trailer_size config.read_timeout_ms {
   Err e -> Err e
   Ok (line, rest) ->
-    if BitString.size line == 0 then Ok rest
-    else consume_trailers config socket rest
+    if used + BitString.size line + 2
+      > config.max_trailer_size then Err BadRequest
+    else if BitString.size line == 0 then Ok rest
+    else consume_trailers_loop config socket rest (used
+      + BitString.size line
+      + 2)
 }
 
 fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError
@@ -760,7 +807,7 @@ handle_connection config socket on_request = case read_until_headers_complete co
   }
   Err HeaderReadBadRequest -> {
     event! HeadersTooLarge
-    send_response config socket "GET" bad_request
+    send_response config socket Http1_1 "GET" bad_request
     Tcp.close socket
   }
   Ok data -> case parse_request config socket data {
@@ -771,12 +818,12 @@ handle_connection config socket on_request = case read_until_headers_complete co
         PayloadTooLarge -> payload_too_large
         ExpectationFailed -> expectation_failed
       }
-      send_response config socket "GET" resp
+      send_response config socket Http1_1 "GET" resp
       Tcp.close socket
     }
     Ok (req, leftover) -> {
       let resp = on_request req
-      send_response config socket req.method resp
+      send_response config socket req.version req.method resp
       # If anything remains in the buffer after the body, the client
       # pipelined a follow-up request. We don't support pipelining,
       # so close rather than letting the bytes hang the connection.
@@ -815,15 +862,15 @@ handle_connection config socket on_request = case read_until_headers_complete co
 # `Eq for msg` even though pid identity at runtime is independent of msg.
 type SupMsg =
   | NewConnection Tcp.Socket
-  | DoShutdown Int # deadline_ms
+  | DoShutdown (deadline_ms: Int)
   deriving (Eq)
 
 opaque type ShutdownHandle = ShutdownHandle (Pid SupMsg)
 
 pub type ShutdownResult =
   | Drained
-  | TimedOut    # deadline fired with connections still alive; count is reported via `ShutdownTimedOut` event
-  | NoReply     # supervisor died for an unexpected reason
+  | TimedOut # deadline fired with connections still alive; count is reported via `ShutdownTimedOut` event
+  | NoReply # supervisor died for an unexpected reason
   deriving (Debug, Eq)
 
 # Acceptor: blocks on Tcp.accept, forwards each new socket to the supervisor.
@@ -839,9 +886,17 @@ acceptor_loop listener sup = case Tcp.accept listener {
     # means the supervisor can later re-transfer to the handler. Without
     # this two-step dance, the socket would die when the acceptor dies on
     # shutdown.
-    let _ = Tcp.controlling_process socket sup
-    send! sup (NewConnection socket)
-    acceptor_loop listener sup
+    case Tcp.controlling_process socket sup {
+      Ok _ -> {
+        send! sup (NewConnection socket)
+        acceptor_loop listener sup
+      }
+      Err e -> {
+        event! (OwnershipTransferFailed e)
+        Tcp.close socket
+        acceptor_loop listener sup
+      }
+    }
   }
   Err e -> {
     # The expected exit path is `e == "closed"` after the supervisor closes
@@ -867,9 +922,17 @@ supervisor_loop config listener on_request conns = receive {
     # controlling process) to the handler. Without this, when the
     # listener closes during shutdown the acceptor dies, taking all
     # in-flight connection sockets with it.
-    let _ = Tcp.controlling_process sock pid
-    let _ref = monitor! pid
-    supervisor_loop config listener on_request ((pid, sock) :: conns)
+    case Tcp.controlling_process sock pid {
+      Ok _ -> {
+        let _ref = monitor! pid
+        supervisor_loop config listener on_request ((pid, sock) :: conns)
+      }
+      Err e -> {
+        event! (OwnershipTransferFailed e)
+        Tcp.close sock
+        supervisor_loop config listener on_request conns
+      }
+    }
   }
   DoShutdown deadline_ms -> {
     # Close listener immediately so no new connections accept. Then
@@ -885,10 +948,11 @@ supervisor_loop config listener on_request conns = receive {
     }) conns
     drain_loop (List.length conns) deadline_ms
   }
-  Down dead _ -> supervisor_loop config listener on_request (List.filter (fun pair -> {
-    let (p, _) = pair
-    p != dead
-  }) conns)
+  Down dead _ ->
+    supervisor_loop config listener on_request (List.filter (fun pair -> {
+      let (p, _) = pair
+      p != dead
+    }) conns)
 }
 
 # Drain phase: wait for connection-handler processes to exit, with a
@@ -924,9 +988,18 @@ serve config on_request = case Tcp.listen config.port 1024 {
     # Hand the listener to the supervisor so it outlives the caller. Without
     # this, when `serve`'s caller exits, gen_tcp closes the listener
     # automatically and the acceptor's pending `accept` errors out.
-    let _ = Tcp.listener_controlling_process listener sup
-    let _ = spawn! (fun () -> acceptor_loop listener sup)
-    Ok (ShutdownHandle sup)
+    case Tcp.listener_controlling_process listener sup {
+      Err e -> {
+        event! (OwnershipTransferFailed e)
+        Tcp.close_listener listener
+        send! sup (DoShutdown 0)
+        Err e
+      }
+      Ok _ -> {
+        let _ = spawn! (fun () -> acceptor_loop listener sup)
+        Ok (ShutdownHandle sup)
+      }
+    }
   }
 }
 
