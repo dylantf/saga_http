@@ -37,28 +37,7 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs",
-        "saga": "saga"
-      }
-    },
-    "saga": {
-      "inputs": {
-        "flake-utils": [
-          "flake-utils"
-        ],
-        "nixpkgs": [
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1777735329,
-        "narHash": "sha256-yRqQiik6292bb9HMWyxKOtQCOrTxLvbdlPAkiWYLNzc=",
-        "path": "/home/dylan/projects/saga",
-        "type": "path"
-      },
-      "original": {
-        "path": "/home/dylan/projects/saga",
-        "type": "path"
+        "nixpkgs": "nixpkgs"
       }
     },
     "systems": {

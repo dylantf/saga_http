@@ -4,16 +4,16 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
-    saga.url = "github:dylantf/saga";
-    saga.inputs.nixpkgs.follows = "nixpkgs";
-    saga.inputs.flake-utils.follows = "flake-utils";
+    # saga.url = "github:dylantf/saga";
+    # saga.inputs.nixpkgs.follows = "nixpkgs";
+    # saga.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs =
     {
       nixpkgs,
       flake-utils,
-      saga,
+      # saga,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -24,17 +24,10 @@
       {
         devShells.default = pkgs.mkShell {
           packages = [
-            saga.packages.${system}.default
+            # saga.packages.${system}.default
             pkgs.erlang
             pkgs.rebar3
           ];
-
-          shellHook = ''
-            if [ -x "$HOME/.saga/bin/saga" ]; then
-              export PATH="$HOME/.saga/bin:$PATH"
-            fi
-            echo "Using saga from $(which saga)"
-          '';
         };
       }
     );
