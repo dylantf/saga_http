@@ -13,6 +13,7 @@ val events_test_port = 18767
 val shutdown_test_port = 18768
 val shutdown_drain_port = 18769
 val shutdown_timeout_port = 18770
+val body_deadline_port = 18771
 
 fun target_label : Http.RequestTarget -> String
 target_label t = case t {
@@ -820,6 +821,56 @@ tests () = {
       assert_eq result Http.Drained
     })
 
+    test "total_body_timeout_ms closes a slow drip body with 408" (fun () -> {
+      # Slowloris-style body drip: per-recv stays under read_timeout_ms but
+      # the cumulative deadline trips. Server should fire
+      # BodyReadDeadlineExceeded, send 408, and close.
+      let result = {
+        let me = self! ()
+        let _ = spawn! (fun () -> {
+          let cfg = { Http.default_config |
+            port: body_deadline_port,
+            read_timeout_ms: 5000,
+            total_body_timeout_ms: 200,
+          }
+          let _ = Http.serve cfg handle
+          ()
+        } with {
+          beam_actor,
+          event e = {
+            send! me e
+            resume ()
+          },
+        })
+        sleep! 100
+
+        let resp = case Tcp.connect "127.0.0.1" body_deadline_port 5000 {
+          Err _ -> Err "connect"
+          Ok sock -> {
+            let _ = Tcp.send sock (BitString.from_string
+              "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
+            # Send 5 bytes, well below CL 1000, then sleep past the deadline.
+            # Per-recv keeps refreshing under read_timeout_ms; the cumulative
+            # deadline is what trips.
+            drip_loop sock 6
+            let r = recv_all sock <<>>
+            let _ = Tcp.close sock
+            case r {
+              Ok bs -> Ok (resp_to_string bs)
+              Err e -> Err e
+            }
+          }
+        }
+        (resp, drain_for_deadline_event 10)
+      } with beam_actor
+      let (resp, saw_event) = result
+      case resp {
+        Ok r -> assert_contains "HTTP/1.1 408 Request Timeout" r
+        Err _ -> assert_true False
+      }
+      assert_true saw_event
+    })
+
     test "shutdown_and_wait drains an in-flight request" (fun () -> {
       # Open a connection and send a request, then start shutdown while the
       # request is being handled. The server should still respond to the
@@ -873,4 +924,26 @@ receive_parse_error budget = receive {
   Http.RequestParseError Http.BadRequest -> True
   _ -> receive_parse_error (budget - 1)
   after 1000 -> False
+}
+
+# Drip a single byte every 50ms `n` times. The per-recv timeout (5s above)
+# stays satisfied, but the cumulative 200ms total_body_timeout_ms expires.
+fun drip_loop : Tcp.Socket -> Int -> Unit needs {Process, Actor a, Timer}
+drip_loop _sock 0 = ()
+drip_loop sock n = {
+  let _ = Tcp.send sock (BitString.from_string "x")
+  sleep! 50
+  drip_loop sock (n - 1)
+}
+
+# Look for either BodyReadDeadlineExceeded directly or the resulting
+# RequestParseError BodyReadTimeout. Both are evidence the cumulative
+# deadline tripped.
+fun drain_for_deadline_event : Int -> Bool needs {Actor Http.ServerEvent, Timer}
+drain_for_deadline_event 0 = False
+drain_for_deadline_event budget = receive {
+  Http.BodyReadDeadlineExceeded -> True
+  Http.RequestParseError Http.BodyReadTimeout -> True
+  _ -> drain_for_deadline_event (budget - 1)
+  after 2000 -> False
 }

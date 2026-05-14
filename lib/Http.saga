@@ -3,6 +3,7 @@ module SagaHttp.Http
 import Std.Actor (Process, Actor, Monitor, Timer, Pid, ExitReason)
 import Std.BitString
 import Std.Int
+import Std.Time
 import SagaHttp.Tcp
 
 # -- Parsing primitives --
@@ -77,6 +78,7 @@ pub type ParseError =
   | PayloadTooLarge
   | ExpectationFailed
   | UnsupportedVersion
+  | BodyReadTimeout
   deriving (Debug, Eq)
 
 # Identifies which `Tcp.send` failed inside a `SendFailed` event so consumers
@@ -99,6 +101,7 @@ pub type ServerEvent =
   | RequestParseError ParseError # parse failed; we already sent the error response
   | HeadersTooLarge # cumulative header cap exceeded; 400 sent
   | BodyReadFailed String # recv failed mid-body; reason is the gen_tcp atom
+  | BodyReadDeadlineExceeded # cumulative body-read deadline expired; 408 sent
   | SendFailed SendSite String # Tcp.send returned Err at the named site
   | OwnershipTransferFailed String # gen_tcp:controlling_process failed
   | PipelinedRequestDropped # leftover bytes after request; connection closed
@@ -159,6 +162,11 @@ pub record Config {
   # trailer headers. Should be shorter than idle_timeout_ms in most
   # deployments; defaulting both to the same value preserves prior behavior.
   read_timeout_ms: Int,
+  # Cumulative wall-clock deadline (ms) for reading a single request body
+  # from the moment body parsing begins. Defends against slowloris-style
+  # drip clients that stay under `read_timeout_ms` per recv but never
+  # finish the body. On expiry the connection is closed with 408.
+  total_body_timeout_ms: Int,
 }
 
 pub val default_config = Config {
@@ -171,6 +179,7 @@ pub val default_config = Config {
   server_name: "saga_http",
   idle_timeout_ms: 30000,
   read_timeout_ms: 30000,
+  total_body_timeout_ms: 60000,
 }
 
 # -- Header helpers --
@@ -256,6 +265,7 @@ status_text code = case code {
   204 -> "No Content"
   400 -> "Bad Request"
   404 -> "Not Found"
+  408 -> "Request Timeout"
   413 -> "Payload Too Large"
   417 -> "Expectation Failed"
   500 -> "Internal Server Error"
@@ -452,6 +462,12 @@ pub val bad_request = Response {
   body: Buffered "Bad Request",
 }
 
+pub val request_timeout = Response {
+  status: 408,
+  headers: [("Content-Type", "text/plain"), ("Connection", "close")],
+  body: Buffered "Request Timeout",
+}
+
 pub val payload_too_large = Response {
   status: 413,
   headers: [("Content-Type", "text/plain"), ("Connection", "close")],
@@ -493,7 +509,8 @@ parse_target method target = {
     <<47, _/binary>> -> Ok (parse_origin target)
     _ ->
       if is_absolute_form bs then Ok (Absolute target)
-      else if method == "CONNECT" && BitString.size bs > 0 then Ok (Authority target)
+      else if method == "CONNECT"
+        && BitString.size bs > 0 then Ok (Authority target)
       else Err BadRequest
   }
 }
@@ -510,7 +527,7 @@ parse_origin target = case String.split "?" target {
 # is handed through verbatim as Absolute.
 fun is_absolute_form : BitString -> Bool
 is_absolute_form bs = case bs {
-  <<c:8, rest/binary>> when (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ->
+  <<c:8, rest/binary>> when c >= 65 && c <= 90 || c >= 97 && c <= 122 ->
     check_scheme_rest rest
   _ -> False
 }
@@ -518,12 +535,13 @@ is_absolute_form bs = case bs {
 fun check_scheme_rest : BitString -> Bool
 check_scheme_rest bs = case bs {
   <<"://", _/binary>> -> True
-  <<c:8, rest/binary>> when (c >= 65 && c <= 90)
-    || (c >= 97 && c <= 122)
-    || (c >= 48 && c <= 57)
+  <<c:8, rest/binary>> when c >= 65 && c <= 90
+    || c >= 97 && c <= 122
+    || c >= 48 && c <= 57
     || c == 43
     || c == 45
-    || c == 46 -> check_scheme_rest rest
+    || c == 46 ->
+    check_scheme_rest rest
   _ -> False
 }
 
@@ -565,6 +583,7 @@ parse_request config socket input = do {
   Err PayloadTooLarge -> Err PayloadTooLarge
   Err ExpectationFailed -> Err ExpectationFailed
   Err UnsupportedVersion -> Err UnsupportedVersion
+  Err BodyReadTimeout -> Err BodyReadTimeout
   _ -> Err BadRequest
 }
 
@@ -614,20 +633,22 @@ read_body config socket headers rest = case validate_framing headers {
       Nothing -> Nothing
     }
     let cl = find_header "content-length" headers
+    let deadline = Time.monotonic_ms () + config.total_body_timeout_ms
     case te {
       Just te_val ->
         if te_val != "chunked" then Err BadRequest
         else case cl {
           # Per RFC 7230, both TE and CL together is suspect: reject.
           Just _ -> Err BadRequest
-          Nothing -> case read_chunked config socket rest <<>> {
+          Nothing -> case read_chunked config socket rest <<>> deadline {
             Ok (body, leftover) -> Ok (Just body, leftover)
             Err e -> Err e
           }
         }
       Nothing -> case cl {
         Nothing -> Ok (Nothing, rest)
-        Just len_str -> read_with_content_length config socket rest len_str
+        Just len_str ->
+          read_with_content_length config socket rest len_str deadline
       }
     }
   }
@@ -679,9 +700,9 @@ validate_framing headers = case find_all_headers "transfer-encoding" headers {
   }
 }
 
-fun read_with_content_length : Config -> Tcp.Socket -> BitString -> String -> Result (Maybe BitString, BitString) ParseError
+fun read_with_content_length : Config -> Tcp.Socket -> BitString -> String -> Int -> Result (Maybe BitString, BitString) ParseError
   needs {Server}
-read_with_content_length config socket rest len_str = case Int.parse len_str {
+read_with_content_length config socket rest len_str deadline = case Int.parse len_str {
   Nothing -> Err BadRequest
   # RFC 9110 §8.6: Content-Length is a non-negative integer. A negative
   # value (or one with a sign prefix) is malformed and must be rejected
@@ -689,22 +710,27 @@ read_with_content_length config socket rest len_str = case Int.parse len_str {
   Just len when len < 0 -> Err BadRequest
   Just len ->
     if len > config.max_body_size then Err PayloadTooLarge
-    else read_content_length_bytes config socket rest len
+    else read_content_length_bytes config socket rest len deadline
 }
 
-fun read_content_length_bytes : Config -> Tcp.Socket -> BitString -> Int -> Result (Maybe BitString, BitString) ParseError
+fun read_content_length_bytes : Config -> Tcp.Socket -> BitString -> Int -> Int -> Result (Maybe BitString, BitString) ParseError
   needs {Server}
-read_content_length_bytes config socket buf len =
+read_content_length_bytes config socket buf len deadline =
   if BitString.size buf >= len then case buf {
     <<body:len/binary, leftover/binary>> -> Ok (Just body, leftover)
     _ -> Err BadRequest
+  }
+  else if Time.monotonic_ms () >= deadline then {
+    event! BodyReadDeadlineExceeded
+    Err BodyReadTimeout
   }
   else case Tcp.recv socket 0 config.read_timeout_ms {
     Err reason -> {
       event! (BodyReadFailed reason)
       Err BadRequest
     }
-    Ok more -> read_content_length_bytes config socket (buf <> more) len
+    Ok more ->
+      read_content_length_bytes config socket (buf <> more) len deadline
   }
 
 # -- Chunked transfer encoding (request) --
@@ -792,45 +818,54 @@ parse_hex_loop bs acc count = case bs {
 # Reads from the socket until `buf` contains a CRLF, returning
 # (line_without_crlf, rest_after_crlf). Bails if the line would exceed
 # `max_size`, to avoid unbounded reads on malicious input.
-fun read_line : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
+fun read_line : Tcp.Socket -> BitString -> Int -> Int -> Int -> Result (BitString, BitString) ParseError
   needs {Server}
-read_line socket buf max_size timeout = case find_crlf buf {
+read_line socket buf max_size timeout deadline = case find_crlf buf {
   Just split -> Ok split
   Nothing ->
     if BitString.size buf >= max_size then Err BadRequest
+    else if Time.monotonic_ms () >= deadline then {
+      event! BodyReadDeadlineExceeded
+      Err BodyReadTimeout
+    }
     else case Tcp.recv socket 0 timeout {
       Err reason -> {
         event! (BodyReadFailed reason)
         Err BadRequest
       }
-      Ok more -> read_line socket (buf <> more) max_size timeout
+      Ok more -> read_line socket (buf <> more) max_size timeout deadline
     }
 }
 
 # Ensures `buf` contains at least `n` bytes, returning (first_n, rest).
-fun read_n : Tcp.Socket -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
+fun read_n : Tcp.Socket -> BitString -> Int -> Int -> Int -> Result (BitString, BitString) ParseError
   needs {Server}
-read_n socket buf n timeout =
+read_n socket buf n timeout deadline =
   if BitString.size buf >= n then case buf {
     <<first:n/binary, rest/binary>> -> Ok (first, rest)
     _ -> Err BadRequest
+  }
+  else if Time.monotonic_ms () >= deadline then {
+    event! BodyReadDeadlineExceeded
+    Err BodyReadTimeout
   }
   else case Tcp.recv socket (n - BitString.size buf) timeout {
     Err reason -> {
       event! (BodyReadFailed reason)
       Err BadRequest
     }
-    Ok more -> read_n socket (buf <> more) n timeout
+    Ok more -> read_n socket (buf <> more) n timeout deadline
   }
 
 # Discards trailer headers up to and including the terminating empty line.
-fun consume_trailers : Config -> Tcp.Socket -> BitString -> Result BitString ParseError
+fun consume_trailers : Config -> Tcp.Socket -> BitString -> Int -> Result BitString ParseError
   needs {Server}
-consume_trailers config socket buf = consume_trailers_loop config socket buf 0
+consume_trailers config socket buf deadline =
+  consume_trailers_loop config socket buf 0 deadline
 
-fun consume_trailers_loop : Config -> Tcp.Socket -> BitString -> Int -> Result BitString ParseError
+fun consume_trailers_loop : Config -> Tcp.Socket -> BitString -> Int -> Int -> Result BitString ParseError
   needs {Server}
-consume_trailers_loop config socket buf used = case read_line socket buf config.max_trailer_size config.read_timeout_ms {
+consume_trailers_loop config socket buf used deadline = case read_line socket buf config.max_trailer_size config.read_timeout_ms deadline {
   Err e -> Err e
   Ok (line, rest) ->
     if used + BitString.size line + 2
@@ -838,33 +873,33 @@ consume_trailers_loop config socket buf used = case read_line socket buf config.
     else if BitString.size line == 0 then Ok rest
     else consume_trailers_loop config socket rest (used
       + BitString.size line
-      + 2)
+      + 2) deadline
 }
 
-fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Result (BitString, BitString) ParseError
+fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError
   needs {Server}
-read_chunked config socket buf acc = case read_line socket buf config.max_chunk_line_size config.read_timeout_ms {
+read_chunked config socket buf acc deadline = case read_line socket buf config.max_chunk_line_size config.read_timeout_ms deadline {
   Err e -> Err e
   Ok (line, after_size) -> case parse_chunk_size line {
     Nothing -> Err BadRequest
-    Just size -> read_chunk_body config socket after_size acc size
+    Just size -> read_chunk_body config socket after_size acc size deadline
   }
 }
 
-fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError
+fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
   needs {Server}
-read_chunk_body config socket buf acc 0 = case consume_trailers config socket buf {
+read_chunk_body config socket buf acc 0 deadline = case consume_trailers config socket buf deadline {
   Err e -> Err e
   Ok rest -> Ok (acc, rest)
 }
-read_chunk_body config socket buf acc size =
+read_chunk_body config socket buf acc size deadline =
   if BitString.size acc + size > config.max_body_size then Err PayloadTooLarge
-  else case read_n socket buf size config.read_timeout_ms {
+  else case read_n socket buf size config.read_timeout_ms deadline {
     Err e -> Err e
-    Ok (chunk, after_chunk) -> case read_n socket after_chunk 2 config.read_timeout_ms {
+    Ok (chunk, after_chunk) -> case read_n socket after_chunk 2 config.read_timeout_ms deadline {
       Err e -> Err e
       Ok (crlf, rest) -> case crlf {
-        <<"\r\n">> -> read_chunked config socket rest (acc <> chunk)
+        <<"\r\n">> -> read_chunked config socket rest (acc <> chunk) deadline
         _ -> Err BadRequest
       }
     }
@@ -924,6 +959,7 @@ handle_connection config socket on_request = case read_until_headers_complete co
         PayloadTooLarge -> payload_too_large
         ExpectationFailed -> expectation_failed
         UnsupportedVersion -> version_not_supported
+        BodyReadTimeout -> request_timeout
       }
       send_response config socket Http1_1 "GET" resp
       Tcp.close socket

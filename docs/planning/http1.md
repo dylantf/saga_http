@@ -51,7 +51,7 @@
 ## Security / robustness
 
 - [ ] Backpressure / connection limits - cap concurrent accepted connections and define behavior when saturated
-- [ ] Total body-read deadline - per-read timeouts exist; consider a total deadline for reading a request body
+- [x] Total body-read deadline - `Config.total_body_timeout_ms` (default 60000) caps cumulative wall-clock time for reading a request body. Computed once at the start of `read_body` as `Time.monotonic_ms() + total_body_timeout_ms` and checked before each `Tcp.recv` in the body-read path (Content-Length, chunked size lines, chunk payloads, trailers). On expiry: emits `BodyReadDeadlineExceeded`, returns `BodyReadTimeout`, sends 408 Request Timeout, and closes the connection. Defends against slowloris-style drip clients that stay under `read_timeout_ms` per recv but never finish.
 - [ ] Public-internet hardening pass - review request smuggling, malformed chunk extensions, odd whitespace, absolute-form targets, and proxy-facing behavior
 
 ## Performance / scalability
