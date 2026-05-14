@@ -33,7 +33,7 @@
 ## Explicit HTTP/1.1 choices
 
 - Request pipelining — do not support it. Clients deprecated it (Chrome years ago, Firefox by default). If a pipelined follow-up request is detected in the parser buffer, respond to the first request and close the connection.
-- Chunked request trailers — currently consumed and ignored. Decide later whether to expose them, validate them more deeply, or keep ignoring them as documented behavior.
+- Chunked request trailers — consumed and discarded. No current consumer needs them, and exposing them later (as an optional field on `Request`) would be a non-breaking addition.
 - Reverse-proxy edge hardening — not yet a goal. The parser is much less naive now, but this is not intended to compete with Cowboy/Hyper as a hardened public edge server yet.
 
 ## HTTP/1.1 core backlog
@@ -42,11 +42,10 @@
 - [x] Request target forms - parse all four RFC 9112 §3.2 forms into a `RequestTarget` variant on `Request` (`Origin path (Maybe query)`, `Absolute uri`, `Authority host:port`, `Asterisk`); `Request.path` is kept as a derived convenience. Validation enforces asterisk-form is OPTIONS-only, authority-form is CONNECT-only, origin-form starts with `/`, absolute-form has a scheme followed by `://`; everything else → 400
 - [ ] Method validation policy - decide whether to accept arbitrary token methods or restrict/normalize common methods
 - [x] HTTP version policy - decide whether unknown versions should be rejected instead of mapped to `Http1_0`
-- [ ] Trailer policy - decide whether to expose trailers, validate them, or keep ignoring them as an explicit documented choice
 - [ ] More status reason phrases - fill out common HTTP status text values, or consider standardizing/omitting reason phrases
 - [x] Binary buffered responses - add a `BufferedBytes BitString` response body variant so non-text responses do not require streaming
 - [ ] Maximum request count per connection - configurable cap for long-lived keep-alive connections
-- [ ] Maximum header count - complement byte-size limits and prevent many tiny headers from stressing parser/list work
+- [x] Maximum header count - `Config.max_header_count` (default 100) caps the number of headers accepted; enforced in `decode_headers` per-iteration, exceeding it returns 400
 
 ## Security / robustness
 

@@ -172,6 +172,10 @@ pub record Config {
   # track. When the cap is reached, newly-accepted sockets are closed
   # immediately and `ConnectionLimitReached` fires. See `supervisor_loop`.
   max_connections: Int,
+  # Cap on the number of headers accepted in a single request. Complements
+  # byte-size limits by preventing many tiny headers from stressing parser
+  # and list work. Exceeding this returns 400.
+  max_header_count: Int,
 }
 
 pub val default_config = Config {
@@ -186,6 +190,7 @@ pub val default_config = Config {
   read_timeout_ms: 30000,
   total_body_timeout_ms: 60000,
   max_connections: 10000,
+  max_header_count: 100,
 }
 
 # -- Header helpers --
@@ -619,8 +624,11 @@ maybe_send_continue socket version headers = case find_header "expect" headers {
 # at the end so the wire-order is preserved for the user.
 pub fun decode_headers : Config -> List (String, String) -> BitString -> Result (List (String, String), BitString) ParseError
 decode_headers config acc input = case decode_header input config.max_header_size {
-  Ok (Header key value rest) ->
-    decode_headers config ((String.to_lower key, value) :: acc) rest
+  Ok (Header key value rest) -> {
+    let next = (String.to_lower key, value) :: acc
+    if List.length next > config.max_header_count then Err BadRequest
+    else decode_headers config next rest
+  }
   Ok (Done rest) -> Ok (List.reverse acc, rest)
   Err _ -> Err BadRequest
 }

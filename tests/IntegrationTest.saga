@@ -331,6 +331,64 @@ tests () = {
       }
     })
 
+    # Only the literal token "chunked" is accepted. Lists like
+    # "gzip, chunked" and aliases like "identity" are rejected with 400.
+    test "Transfer-Encoding: gzip, chunked returns 400" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\nbody"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "Transfer-Encoding: identity returns 400" (fun () -> {
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity\r\n\r\nbody"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    # Method is currently accepted as any HTTP token. Document via test:
+    # unknown methods reach `handle`, invalid characters are rejected at parse.
+    test "unknown but valid method is accepted (token methods pass through)" (fun () -> {
+      let req = "BREW /coffee HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 200 OK" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "method with invalid character returns 400" (fun () -> {
+      let req =
+        BitString.from_string "GE" <> <<0>>
+          <> BitString.from_string "T /foo HTTP/1.1\r\nHost: localhost\r\n\r\n"
+      case Tcp.connect "127.0.0.1" test_port 5000 {
+        Err _ -> assert_true False
+        Ok sock -> {
+          let _ = Tcp.send sock req
+          let r = recv_all sock <<>>
+          let _ = Tcp.close sock
+          case r {
+            Ok bs -> assert_contains "HTTP/1.1 400 Bad Request" (resp_to_string bs)
+            Err _ -> assert_true False
+          }
+        }
+      }
+    })
+
+    test "too many headers returns 400" (fun () -> {
+      # max_header_count defaults to 100; 200 small valid headers exceeds it.
+      let many = String.repeat 200 "X-A: 1\r\n"
+      let req = $"GET / HTTP/1.1\r\nHost: localhost\r\n{many}\r\n"
+      case request req {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
     test "Expect: 100-continue gets interim 100 Continue then final 200" (fun () -> {
       let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
         <> "hello"
