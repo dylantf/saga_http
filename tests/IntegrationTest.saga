@@ -33,6 +33,10 @@ handle req =
     write_chunk! (BitString.from_string "beta")
   })
   else if req.path == "/bytes" then Http.bytes 200 [("Content-Type", "application/octet-stream")] <<0, 255, 128, 1, 254>>
+  else if req.path == "/peer" then {
+    let (ip, port) = req.peer
+    Http.text 200 $"peer: {ip}:{show port}"
+  }
   else if req.path
     == "/cookies" then Response {
     status: 200,
@@ -159,6 +163,21 @@ tests () = {
       })
       sleep! 200
     } with { beam_actor, discard_events }
+
+    test "peer address is exposed on Request" (fun () -> {
+      case request "GET /peer HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "peer: 127.0.0.1:" r
+          # Ephemeral client ports allocated by the kernel are always > 0;
+          # a "127.0.0.1:0" substring would mean peername gave us a
+          # degenerate value (or our fallback fired).
+          if String.contains "127.0.0.1:0" r then assert_true False
+          else assert_true True
+        }
+        Err _ -> assert_true False
+      }
+    })
 
     test "GET returns 200 with body" (fun () -> {
       case request "GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {

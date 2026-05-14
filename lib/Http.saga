@@ -53,6 +53,10 @@ pub record Request {
   # Order is preserved as it appeared on the wire.
   headers: List (String, String),
   body: Maybe BitString,
+  # IP and port of the connecting client, captured once per connection.
+  # ("", 0) if `Tcp.peername` failed at connection setup (a
+  # `PeerAddressUnavailable` event fires in that case).
+  peer: (String, Int),
 }
 
 pub effect Chunked {
@@ -107,6 +111,7 @@ pub type ServerEvent =
   | PipelinedRequestDropped # leftover bytes after request; connection closed
   | ConnectionLimitReached # `max_connections` cap hit; new socket dropped without response
   | ShutdownTimedOut Int # graceful shutdown deadline expired; arg is # of connections still alive
+  | PeerAddressUnavailable String # Tcp.peername failed at connection setup; req.peer falls back to ("", 0)
   deriving (Debug)
 
 pub effect Server {
@@ -569,9 +574,9 @@ target_path t = case t {
 # Returns the parsed Request along with any leftover bytes after the body
 # (a non-empty leftover indicates a pipelined follow-up request, which we
 # don't support — the caller should close the connection).
-pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result (Request, BitString) ParseError
+pub fun parse_request : Config -> Tcp.Socket -> (String, Int) -> BitString -> Result (Request, BitString) ParseError
   needs {Server}
-parse_request config socket input = do {
+parse_request config socket peer input = do {
   Ok (method, raw_target, version_tuple, rest) <- decode_request_line input config.max_header_size
   Ok version <- parse_version version_tuple
   Ok target <- parse_target method raw_target
@@ -587,6 +592,7 @@ parse_request config socket input = do {
       version: version,
       headers: headers,
       body: body,
+      peer: peer,
     },
     leftover,
   )
@@ -951,7 +957,22 @@ connection_tokens v =
 # or the connection should close.
 pub fun handle_connection : Config -> Tcp.Socket -> (Request -> Response) -> Unit
   needs {Server}
-handle_connection config socket on_request = case read_until_headers_complete config socket <<>> config.idle_timeout_ms {
+handle_connection config socket on_request = {
+  # `peername` is stable for the life of the socket, so we resolve it once
+  # per connection and thread it into every request parsed on this socket.
+  let peer = case Tcp.peername socket {
+    Ok p -> p
+    Err e -> {
+      event! (PeerAddressUnavailable e)
+      ("", 0)
+    }
+  }
+  handle_connection_loop config socket peer on_request
+}
+
+fun handle_connection_loop : Config -> Tcp.Socket -> (String, Int) -> (Request -> Response) -> Unit
+  needs {Server}
+handle_connection_loop config socket peer on_request = case read_until_headers_complete config socket <<>> config.idle_timeout_ms {
   Err HeaderReadClosed -> {
     event! ClientDisconnected
     Tcp.close socket
@@ -965,7 +986,7 @@ handle_connection config socket on_request = case read_until_headers_complete co
     send_response config socket Http1_1 "GET" bad_request
     Tcp.close socket
   }
-  Ok data -> case parse_request config socket data {
+  Ok data -> case parse_request config socket peer data {
     Err err -> {
       event! (RequestParseError err)
       let resp = case err {
@@ -988,7 +1009,7 @@ handle_connection config socket on_request = case read_until_headers_complete co
         event! PipelinedRequestDropped
         Tcp.close socket
       }
-      else if should_keep_alive req then handle_connection config socket on_request
+      else if should_keep_alive req then handle_connection_loop config socket peer on_request
       else Tcp.close socket
     }
   }

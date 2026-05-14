@@ -77,7 +77,7 @@
 
 ## Request metadata
 
-- [ ] Peer address on `Request` - expose `Tcp.peername` so handlers can see the connecting client (logging, IP-based decisions). Local address and scheme can follow if there's demand.
+- [x] Peer address on `Request` - expose `Tcp.peername` so handlers can see the connecting client (logging, IP-based decisions). Local address and scheme can follow if there's demand.
 
 ## Documentation
 

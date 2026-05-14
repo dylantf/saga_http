@@ -22,6 +22,7 @@ req_with version headers = Request {
   version: version,
   headers: headers,
   body: Nothing,
+  peer: ("127.0.0.1", 0),
 }
 
 pub fun tests : Unit -> Unit needs {Testing}
