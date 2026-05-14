@@ -14,6 +14,7 @@ val shutdown_test_port = 18768
 val shutdown_drain_port = 18769
 val shutdown_timeout_port = 18770
 val body_deadline_port = 18771
+val max_conns_port = 18772
 
 fun target_label : Http.RequestTarget -> String
 target_label t = case t {
@@ -871,6 +872,53 @@ tests () = {
       assert_true saw_event
     })
 
+    test "max_connections caps concurrent connections and fires ConnectionLimitReached" (fun () -> {
+      let result = {
+        let me = self! ()
+        let _ = spawn! (fun () -> {
+          let cfg = { Http.default_config | port: max_conns_port, max_connections: 2 }
+          let _ = Http.serve cfg handle
+          ()
+        } with {
+          beam_actor,
+          event e = {
+            send! me e
+            resume ()
+          },
+        })
+        sleep! 100
+
+        # Open three connections that send nothing — they sit in the
+        # initial header read, holding a slot each.
+        let s1 = Tcp.connect "127.0.0.1" max_conns_port 5000
+        let s2 = Tcp.connect "127.0.0.1" max_conns_port 5000
+        sleep! 50
+        let s3 = Tcp.connect "127.0.0.1" max_conns_port 5000
+
+        # The third socket should be force-closed by the supervisor.
+        # `recv` returns Err once the peer closes.
+        let third_closed = case s3 {
+          Err _ -> False
+          Ok sock -> {
+            let r = Tcp.recv sock 0 2000
+            let _ = Tcp.close sock
+            case r {
+              Err _ -> True
+              Ok _ -> False
+            }
+          }
+        }
+
+        let _ = case s1 { Ok sock -> Tcp.close sock; _ -> () }
+        let _ = case s2 { Ok sock -> Tcp.close sock; _ -> () }
+
+        (third_closed, drain_for_limit_event 10)
+      } with beam_actor
+      let (third_closed, saw_event) = result
+      assert_true third_closed
+      assert_true saw_event
+    })
+
     test "shutdown_and_wait drains an in-flight request" (fun () -> {
       # Open a connection and send a request, then start shutdown while the
       # request is being handled. The server should still respond to the
@@ -934,6 +982,14 @@ drip_loop sock n = {
   let _ = Tcp.send sock (BitString.from_string "x")
   sleep! 50
   drip_loop sock (n - 1)
+}
+
+fun drain_for_limit_event : Int -> Bool needs {Actor Http.ServerEvent, Timer}
+drain_for_limit_event 0 = False
+drain_for_limit_event budget = receive {
+  Http.ConnectionLimitReached -> True
+  _ -> drain_for_limit_event (budget - 1)
+  after 2000 -> False
 }
 
 # Look for either BodyReadDeadlineExceeded directly or the resulting

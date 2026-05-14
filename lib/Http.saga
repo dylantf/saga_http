@@ -105,6 +105,7 @@ pub type ServerEvent =
   | SendFailed SendSite String # Tcp.send returned Err at the named site
   | OwnershipTransferFailed String # gen_tcp:controlling_process failed
   | PipelinedRequestDropped # leftover bytes after request; connection closed
+  | ConnectionLimitReached # `max_connections` cap hit; new socket dropped without response
   | ShutdownTimedOut Int # graceful shutdown deadline expired; arg is # of connections still alive
   deriving (Debug)
 
@@ -167,6 +168,10 @@ pub record Config {
   # drip clients that stay under `read_timeout_ms` per recv but never
   # finish the body. On expiry the connection is closed with 408.
   total_body_timeout_ms: Int,
+  # Cap on the number of simultaneous connections the supervisor will
+  # track. When the cap is reached, newly-accepted sockets are closed
+  # immediately and `ConnectionLimitReached` fires. See `supervisor_loop`.
+  max_connections: Int,
 }
 
 pub val default_config = Config {
@@ -180,6 +185,7 @@ pub val default_config = Config {
   idle_timeout_ms: 30000,
   read_timeout_ms: 30000,
   total_body_timeout_ms: 60000,
+  max_connections: 10000,
 }
 
 # -- Header helpers --
@@ -1059,24 +1065,37 @@ acceptor_loop listener sup = case Tcp.accept listener {
 fun supervisor_loop : Config -> Tcp.ListenSocket -> (Request -> Response) -> List (Pid SupMsg, Tcp.Socket) -> Unit
   needs {Process, Actor SupMsg, Monitor, Timer, Server}
 supervisor_loop config listener on_request conns = receive {
-  NewConnection sock -> {
-    let pid = spawn! (fun () -> handle_connection config sock on_request)
-    # Transfer the accepted socket from the acceptor (its current
-    # controlling process) to the handler. Without this, when the
-    # listener closes during shutdown the acceptor dies, taking all
-    # in-flight connection sockets with it.
-    case Tcp.controlling_process sock pid {
-      Ok _ -> {
-        let _ref = monitor! pid
-        supervisor_loop config listener on_request ((pid, sock) :: conns)
-      }
-      Err e -> {
-        event! (OwnershipTransferFailed e)
-        Tcp.close sock
-        supervisor_loop config listener on_request conns
+  NewConnection sock ->
+    # Backpressure: cap concurrent connections at `max_connections`. The
+    # acceptor keeps accepting (simpler than a pause/resume protocol);
+    # the supervisor sheds load by closing the new socket immediately.
+    # Trade-off: every over-cap connection still costs an accept + a
+    # round trip through the supervisor mailbox before we drop it. If
+    # that becomes a hotspot, push the cap check into the acceptor and
+    # have the supervisor signal it when capacity returns.
+    if List.length conns >= config.max_connections then {
+      event! ConnectionLimitReached
+      Tcp.close sock
+      supervisor_loop config listener on_request conns
+    }
+    else {
+      let pid = spawn! (fun () -> handle_connection config sock on_request)
+      # Transfer the accepted socket from the acceptor (its current
+      # controlling process) to the handler. Without this, when the
+      # listener closes during shutdown the acceptor dies, taking all
+      # in-flight connection sockets with it.
+      case Tcp.controlling_process sock pid {
+        Ok _ -> {
+          let _ref = monitor! pid
+          supervisor_loop config listener on_request ((pid, sock) :: conns)
+        }
+        Err e -> {
+          event! (OwnershipTransferFailed e)
+          Tcp.close sock
+          supervisor_loop config listener on_request conns
+        }
       }
     }
-  }
   DoShutdown deadline_ms -> {
     # Close listener immediately so no new connections accept. Then
     # close every tracked connection socket — this wakes any blocked

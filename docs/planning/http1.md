@@ -50,7 +50,7 @@
 
 ## Security / robustness
 
-- [ ] Backpressure / connection limits - cap concurrent accepted connections and define behavior when saturated
+- [x] Backpressure / connection limits - `Config.max_connections` (default 10000) caps simultaneously-tracked connections. When at the cap, the supervisor closes newly-accepted sockets immediately and fires `ConnectionLimitReached`. The acceptor keeps accepting (the supervisor sheds load) — simpler than an accept-pause protocol; revisit if the per-drop accept cost becomes a hotspot.
 - [x] Total body-read deadline - `Config.total_body_timeout_ms` (default 60000) caps cumulative wall-clock time for reading a request body. Computed once at the start of `read_body` as `Time.monotonic_ms() + total_body_timeout_ms` and checked before each `Tcp.recv` in the body-read path (Content-Length, chunked size lines, chunk payloads, trailers). On expiry: emits `BodyReadDeadlineExceeded`, returns `BodyReadTimeout`, sends 408 Request Timeout, and closes the connection. Defends against slowloris-style drip clients that stay under `read_timeout_ms` per recv but never finish.
 - [ ] Public-internet hardening pass - review request smuggling, malformed chunk extensions, odd whitespace, absolute-form targets, and proxy-facing behavior
 
@@ -61,7 +61,6 @@
 - [ ] Track latency percentiles - report p50/p95/p99, not only requests/sec
 - [ ] Track BEAM/runtime stats - memory, process count, port count, reductions, scheduler utilization, run queue, and garbage collections
 - [ ] Acceptor pool - evaluate multiple acceptor processes instead of one recursive accept loop
-- [ ] Connection limits - cap max concurrent connections and define overload behavior
 - [ ] Request limits - cap max requests per keep-alive connection
 - [ ] Socket option tuning - evaluate `nodelay`, send/recv buffer sizes, send timeouts, backlog size, and OS file-descriptor limits
 - [ ] Parser allocation profile - measure cost of `BitString` concatenation, header scanning, lowercasing, and list accumulation under load
