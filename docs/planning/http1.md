@@ -39,7 +39,7 @@
 ## HTTP/1.1 core backlog
 
 - [ ] Transfer-Encoding list parsing - decide whether to support ordered values like `Transfer-Encoding: gzip, chunked`; otherwise reject anything except a single final `chunked` token with clear tests
-- [ ] Request target forms - decide and test origin-form (`/path`), absolute-form (`http://host/path`), authority-form (`CONNECT host:port`), and asterisk-form (`OPTIONS *`)
+- [x] Request target forms - parse all four RFC 9112 §3.2 forms into a `RequestTarget` variant on `Request` (`Origin path (Maybe query)`, `Absolute uri`, `Authority host:port`, `Asterisk`); `Request.path` is kept as a derived convenience. Validation enforces asterisk-form is OPTIONS-only, authority-form is CONNECT-only, origin-form starts with `/`, absolute-form has a scheme followed by `://`; everything else → 400
 - [ ] Method validation policy - decide whether to accept arbitrary token methods or restrict/normalize common methods
 - [x] HTTP version policy - decide whether unknown versions should be rejected instead of mapped to `Http1_0`
 - [ ] Trailer policy - decide whether to expose trailers, validate them, or keep ignoring them as an explicit documented choice

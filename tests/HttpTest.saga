@@ -18,6 +18,7 @@ fun req_with : Http.HttpVersion -> List (String, String) -> Http.Request
 req_with version headers = Request {
   method: "GET",
   path: "/",
+  target: Http.Origin "/" Nothing,
   version: version,
   headers: headers,
   body: Nothing,

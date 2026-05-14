@@ -31,9 +31,21 @@ pub fun current_http_date : Unit -> String
 
 pub type HttpVersion = Http1_0 | Http1_1 deriving (Debug, Eq)
 
+# RFC 9112 §3.2 request-target forms. `path` on `Request` is still derived
+# from this (path portion for Origin/Absolute, the authority string for
+# Authority, "*" for Asterisk) so existing handlers that only look at
+# `req.path` keep working; new code can match on `req.target` directly.
+pub type RequestTarget =
+  | Origin String (Maybe String)
+  | Absolute String
+  | Authority String
+  | Asterisk
+  deriving (Debug, Eq)
+
 pub record Request {
   method: String,
   path: String,
+  target: RequestTarget,
   version: HttpVersion,
   # Header names are lowercased on the request side for case-insensitive
   # matching (HTTP header names are case-insensitive per RFC 9110).
@@ -467,14 +479,73 @@ parse_version v = case v {
   _ -> Err UnsupportedVersion
 }
 
+# Parse the raw request-target string per RFC 9112 §3.2. The bridge hands
+# us the target verbatim; the four forms are distinguished syntactically
+# and constrained by method (asterisk-form is OPTIONS-only, authority-form
+# is CONNECT-only).
+pub fun parse_target : String -> String -> Result RequestTarget ParseError
+parse_target method target = {
+  let bs = BitString.from_string target
+  case bs {
+    <<"*">> ->
+      if method == "OPTIONS" then Ok Asterisk
+      else Err BadRequest
+    <<47, _/binary>> -> Ok (parse_origin target)
+    _ ->
+      if is_absolute_form bs then Ok (Absolute target)
+      else if method == "CONNECT" && BitString.size bs > 0 then Ok (Authority target)
+      else Err BadRequest
+  }
+}
+
+fun parse_origin : String -> RequestTarget
+parse_origin target = case String.split "?" target {
+  [] -> Origin target Nothing
+  [p] -> Origin p Nothing
+  p :: rest -> Origin p (Just (String.join "?" rest))
+}
+
+# RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). We
+# only need to verify the prefix up to `://` here — the rest of the URI
+# is handed through verbatim as Absolute.
+fun is_absolute_form : BitString -> Bool
+is_absolute_form bs = case bs {
+  <<c:8, rest/binary>> when (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ->
+    check_scheme_rest rest
+  _ -> False
+}
+
+fun check_scheme_rest : BitString -> Bool
+check_scheme_rest bs = case bs {
+  <<"://", _/binary>> -> True
+  <<c:8, rest/binary>> when (c >= 65 && c <= 90)
+    || (c >= 97 && c <= 122)
+    || (c >= 48 && c <= 57)
+    || c == 43
+    || c == 45
+    || c == 46 -> check_scheme_rest rest
+  _ -> False
+}
+
+# Path shown to handlers via `Request.path` — preserves the existing
+# single-string surface for code that doesn't care about target form.
+fun target_path : RequestTarget -> String
+target_path t = case t {
+  Origin p _ -> p
+  Absolute uri -> uri
+  Authority a -> a
+  Asterisk -> "*"
+}
+
 # Returns the parsed Request along with any leftover bytes after the body
 # (a non-empty leftover indicates a pipelined follow-up request, which we
 # don't support — the caller should close the connection).
 pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result (Request, BitString) ParseError
   needs {Server}
 parse_request config socket input = do {
-  Ok (method, path, version_tuple, rest) <- decode_request_line input config.max_header_size
+  Ok (method, raw_target, version_tuple, rest) <- decode_request_line input config.max_header_size
   Ok version <- parse_version version_tuple
+  Ok target <- parse_target method raw_target
   Ok (headers, rest) <- decode_headers config [] rest
   Ok _ <- validate_body_framing config headers
   Ok _ <- maybe_send_continue socket version headers
@@ -482,7 +553,8 @@ parse_request config socket input = do {
   Ok (
     Request {
       method: method,
-      path: path,
+      path: target_path target,
+      target: target,
       version: version,
       headers: headers,
       body: body,

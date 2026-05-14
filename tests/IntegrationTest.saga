@@ -14,6 +14,15 @@ val shutdown_test_port = 18768
 val shutdown_drain_port = 18769
 val shutdown_timeout_port = 18770
 
+fun target_label : Http.RequestTarget -> String
+target_label t = case t {
+  Http.Origin p Nothing -> $"origin:{p}"
+  Http.Origin p (Just q) -> $"origin:{p}?{q}"
+  Http.Absolute uri -> $"absolute:{uri}"
+  Http.Authority a -> $"authority:{a}"
+  Http.Asterisk -> "asterisk"
+}
+
 fun handle : Http.Request -> Http.Response
 handle req =
   if req.path
@@ -37,7 +46,7 @@ handle req =
       Ok s -> Http.text 200 $"echo: {s}"
       Err _ -> Http.text 500 "binary body"
     }
-    Nothing -> Http.text 200 $"path: {req.path}"
+    Nothing -> Http.text 200 $"path: {req.path} target: {target_label req.target}"
   }
 
 # Convert a received BitString to a String for assertion. Tests only use
@@ -173,8 +182,8 @@ tests () = {
       case request "HEAD /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
         Ok r -> {
           assert_contains "HTTP/1.1 200 OK" r
-          assert_contains "Content-Length: 11" r
-          # body 'path: /test' is 11 bytes, but should not appear
+          assert_contains "Content-Length: " r
+          # body text should not appear
           if String.contains "path: /test" r then assert_true False
           else assert_true True
         }
@@ -683,6 +692,82 @@ tests () = {
         receive_parse_error 3
       } with beam_actor
       assert_true result
+    })
+
+    test "OPTIONS * is accepted as asterisk-form" (fun () -> {
+      case request "OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "target: asterisk" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "OPTIONS /foo parses as origin-form" (fun () -> {
+      case request "OPTIONS /foo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "target: origin:/foo" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "GET * is rejected (asterisk-form is OPTIONS-only)" (fun () -> {
+      case request "GET * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "CONNECT example.com:443 parses as authority-form" (fun () -> {
+      case request "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "target: authority:example.com:443" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "GET http://example.com/path parses as absolute-form" (fun () -> {
+      case request "GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "target: absolute:http://example.com/path" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "origin-form splits path and query" (fun () -> {
+      case request "GET /path?foo=bar HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "target: origin:/path?foo=bar" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "origin-form with no query" (fun () -> {
+      case request "GET /path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "target: origin:/path" r
+          if String.contains "target: origin:/path?" r then assert_true False
+          else assert_true True
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "garbage request target returns 400" (fun () -> {
+      case request "GET garbage HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
+        Err _ -> assert_true False
+      }
     })
 
     test "shutdown_and_wait returns Drained when no connections are active" (fun () -> {

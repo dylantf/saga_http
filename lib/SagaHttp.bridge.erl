@@ -69,14 +69,19 @@ close(Socket) ->
 % option; lines exceeding it return {error, _} which we map to BadRequest.
 decode_request_line(Data, MaxSize) ->
     case erlang:decode_packet(http_bin, Data, [{packet_size, MaxSize}]) of
-        {ok, {http_request, Method, {abs_path, Path}, {Major, Minor}}, Rest} ->
+        {ok, {http_request, Method, Target, {Major, Minor}}, Rest} ->
             MethodBin =
                 if
                     is_atom(Method) -> atom_to_binary(Method);
                     is_binary(Method) -> Method;
                     true -> iolist_to_binary(io_lib:format("~p", [Method]))
                 end,
-            {ok, {MethodBin, Path, {Major, Minor}, Rest}};
+            %% Reconstruct the raw target as a binary so the saga side can
+            %% parse the four RFC 9112 §3.2 request-target forms itself.
+            %% decode_packet pre-classifies the target; we just stringify
+            %% it back to its wire representation without interpretation.
+            TargetBin = target_to_binary(Target),
+            {ok, {MethodBin, TargetBin, {Major, Minor}, Rest}};
         {ok, {http_error, _Line}, _Rest} ->
             {error, <<"parse_error">>};
         {more, _} ->
@@ -84,6 +89,23 @@ decode_request_line(Data, MaxSize) ->
         {error, _Reason} ->
             {error, <<"parse_error">>}
     end.
+
+target_to_binary({abs_path, P}) ->
+    P;
+target_to_binary({absoluteURI, Scheme, Host, undefined, Path}) ->
+    iolist_to_binary([atom_to_binary(Scheme), <<"://">>, Host, Path]);
+target_to_binary({absoluteURI, Scheme, Host, Port, Path}) ->
+    iolist_to_binary([
+        atom_to_binary(Scheme), <<"://">>, Host, <<":">>, integer_to_binary(Port), Path
+    ]);
+target_to_binary({scheme, Host, Port}) ->
+    iolist_to_binary([Host, <<":">>, Port]);
+target_to_binary('*') ->
+    <<"*">>;
+target_to_binary(B) when is_binary(B) ->
+    B;
+target_to_binary(Other) ->
+    iolist_to_binary(io_lib:format("~p", [Other])).
 
 % httph_bin parses headers and end-of-headers
 decode_header(Data, MaxSize) ->
