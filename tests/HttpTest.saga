@@ -27,16 +27,16 @@ pub fun tests : Unit -> Unit needs {Testing}
 tests () = {
   describe "parse_version" (fun () -> {
     test "1.1 -> Http1_1" (fun () -> {
-      assert_eq (Http.parse_version (1, 1)) Http.Http1_1
+      assert_eq (Http.parse_version (1, 1)) (Ok Http.Http1_1)
     })
     test "1.0 -> Http1_0" (fun () -> {
-      assert_eq (Http.parse_version (1, 0)) Http.Http1_0
+      assert_eq (Http.parse_version (1, 0)) (Ok Http.Http1_0)
     })
-    test "0.9 falls back to Http1_0" (fun () -> {
-      assert_eq (Http.parse_version (0, 9)) Http.Http1_0
+    test "0.9 -> UnsupportedVersion" (fun () -> {
+      assert_eq (Http.parse_version (0, 9)) (Err Http.UnsupportedVersion)
     })
-    test "2.0 falls back to Http1_0" (fun () -> {
-      assert_eq (Http.parse_version (2, 0)) Http.Http1_0
+    test "2.0 -> UnsupportedVersion" (fun () -> {
+      assert_eq (Http.parse_version (2, 0)) (Err Http.UnsupportedVersion)
     })
   })
 

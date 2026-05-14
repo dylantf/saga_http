@@ -189,6 +189,40 @@ tests () = {
       }
     })
 
+    test "HTTP/0.9 request returns 505" (fun () -> {
+      case request "GET / HTTP/0.9\r\nHost: localhost\r\n\r\n" {
+        Ok r -> assert_contains "HTTP/1.1 505 HTTP Version Not Supported" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "HTTP/2.0 request returns 505" (fun () -> {
+      case request "GET / HTTP/2.0\r\nHost: localhost\r\n\r\n" {
+        Ok r -> assert_contains "HTTP/1.1 505 HTTP Version Not Supported" r
+        Err _ -> assert_true False
+      }
+    })
+
+    test "HTTP/1.0 request is accepted" (fun () -> {
+      case request "GET /test HTTP/1.0\r\nHost: localhost\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.0 200 OK" r
+          assert_contains "path: /test" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "HTTP/1.1 request is accepted" (fun () -> {
+      case request "GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "path: /test" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
     test "oversized Content-Length returns 413" (fun () -> {
       case request "POST /huge HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999999\r\n\r\n" {
         Ok r -> assert_contains "HTTP/1.1 413 Payload Too Large" r

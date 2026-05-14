@@ -64,6 +64,7 @@ pub type ParseError =
   | BadRequest
   | PayloadTooLarge
   | ExpectationFailed
+  | UnsupportedVersion
   deriving (Debug, Eq)
 
 # Identifies which `Tcp.send` failed inside a `SendFailed` event so consumers
@@ -246,6 +247,7 @@ status_text code = case code {
   413 -> "Payload Too Large"
   417 -> "Expectation Failed"
   500 -> "Internal Server Error"
+  505 -> "HTTP Version Not Supported"
   _ -> "Unknown"
 }
 
@@ -450,12 +452,19 @@ pub val expectation_failed = Response {
   body: Buffered "Expectation Failed",
 }
 
+pub val version_not_supported = Response {
+  status: 505,
+  headers: [("Content-Type", "text/plain"), ("Connection", "close")],
+  body: Buffered "HTTP Version Not Supported",
+}
+
 # -- Request parsing --
 
-pub fun parse_version : (Int, Int) -> HttpVersion
+pub fun parse_version : (Int, Int) -> Result HttpVersion ParseError
 parse_version v = case v {
-  (1, 1) -> Http1_1
-  _ -> Http1_0
+  (1, 1) -> Ok Http1_1
+  (1, 0) -> Ok Http1_0
+  _ -> Err UnsupportedVersion
 }
 
 # Returns the parsed Request along with any leftover bytes after the body
@@ -465,15 +474,16 @@ pub fun parse_request : Config -> Tcp.Socket -> BitString -> Result (Request, Bi
   needs {Server}
 parse_request config socket input = do {
   Ok (method, path, version_tuple, rest) <- decode_request_line input config.max_header_size
+  Ok version <- parse_version version_tuple
   Ok (headers, rest) <- decode_headers config [] rest
   Ok _ <- validate_body_framing config headers
-  Ok _ <- maybe_send_continue socket (parse_version version_tuple) headers
+  Ok _ <- maybe_send_continue socket version headers
   Ok (body, leftover) <- read_body config socket headers rest
   Ok (
     Request {
       method: method,
       path: path,
-      version: parse_version version_tuple,
+      version: version,
       headers: headers,
       body: body,
     },
@@ -482,6 +492,7 @@ parse_request config socket input = do {
 } else {
   Err PayloadTooLarge -> Err PayloadTooLarge
   Err ExpectationFailed -> Err ExpectationFailed
+  Err UnsupportedVersion -> Err UnsupportedVersion
   _ -> Err BadRequest
 }
 
@@ -840,6 +851,7 @@ handle_connection config socket on_request = case read_until_headers_complete co
         BadRequest -> bad_request
         PayloadTooLarge -> payload_too_large
         ExpectationFailed -> expectation_failed
+        UnsupportedVersion -> version_not_supported
       }
       send_response config socket Http1_1 "GET" resp
       Tcp.close socket

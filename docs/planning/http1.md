@@ -41,10 +41,10 @@
 - [ ] Transfer-Encoding list parsing - decide whether to support ordered values like `Transfer-Encoding: gzip, chunked`; otherwise reject anything except a single final `chunked` token with clear tests
 - [ ] Request target forms - decide and test origin-form (`/path`), absolute-form (`http://host/path`), authority-form (`CONNECT host:port`), and asterisk-form (`OPTIONS *`)
 - [ ] Method validation policy - decide whether to accept arbitrary token methods or restrict/normalize common methods
-- [ ] HTTP version policy - decide whether unknown versions should be rejected instead of mapped to `Http1_0`
+- [x] HTTP version policy - decide whether unknown versions should be rejected instead of mapped to `Http1_0`
 - [ ] Trailer policy - decide whether to expose trailers, validate them, or keep ignoring them as an explicit documented choice
 - [ ] More status reason phrases - fill out common HTTP status text values, or consider standardizing/omitting reason phrases
-- [ ] Binary buffered responses - add a `BufferedBytes BitString` response body variant so non-text responses do not require streaming
+- [x] Binary buffered responses - add a `BufferedBytes BitString` response body variant so non-text responses do not require streaming
 - [ ] Maximum request count per connection - configurable cap for long-lived keep-alive connections
 - [ ] Maximum header count - complement byte-size limits and prevent many tiny headers from stressing parser/list work
 
