@@ -23,10 +23,13 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          packages = [
+          packages = with pkgs; [
+            bashInteractive
+
+            # Use dev `saga` + erlang directly instead of flake
             # saga.packages.${system}.default
-            pkgs.erlang
-            pkgs.rebar3
+            erlang
+            rebar3
           ];
         };
       }

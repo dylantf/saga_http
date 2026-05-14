@@ -1,3 +1,10 @@
+#@ Low-level HTTP/1.1 server: request parsing, response encoding, connection lifecycle, supervised listener with graceful shutdown.
+#@
+#@ Consumers typically reach for `serve` plus a `Request -> Response`
+#@ handler; routers, effectful handlers, and anything more elaborate live
+#@ in libraries built on top. See `docs/library-guide.md` for a how-to-use
+#@ overview and `docs/planning/http1.md` for the roadmap and explicit
+#@ scope decisions.
 module SagaHttp.Http
 
 import Std.Actor (Process, Actor, Monitor, Timer, Pid, ExitReason)
@@ -7,35 +14,47 @@ import Std.Time
 import SagaHttp.Tcp
 
 # -- Parsing primitives --
-
+#
 # Wire-level helpers from the bridge. The "rest" pieces are BitString
 # because they're opaque bytes; the structured fields are String because
-# we know they're ASCII text once decode_packet has parsed them.
+# we know they're ASCII text once decode_packet has parsed them. Most
+# consumers want `parse_request`; these are exposed for code that needs
+# to drive the parser directly.
 
+#@ Result of one `decode_header` call: either a parsed `(name, value)` pair
+#@ plus the unconsumed bytes, or `Done rest` indicating the headers section
+#@ has terminated and `rest` is the start of the body.
 pub type HeaderResult =
   | Header String String BitString
   | Done BitString
 
+#@ Parse the request line off the front of `data`, returning
+#@ `(method, target, (major, minor), rest)`. `max_size` caps the request
+#@ line length; longer lines fail (→ 400 in the default loop).
 @external("erlang", "SagaHttp.bridge", "decode_request_line")
 pub fun decode_request_line : (data: BitString) -> (max_size: Int) -> Result (String, String, (Int, Int), BitString) String
 
+#@ Parse one header line off the front of `data`. See `HeaderResult`.
+#@ `max_size` caps the line length.
 @external("erlang", "SagaHttp.bridge", "decode_header")
 pub fun decode_header : (data: BitString) -> (max_size: Int) -> Result HeaderResult String
 
-# Returns the current UTC time as an IMF-fixdate string suitable for the
-# `Date` response header. NOT pure (it reads the system clock); typed as
-# pure for FFI ergonomics, matching the rest of our bridge surface.
+#@ Returns the current UTC time as an IMF-fixdate string suitable for the
+#@ `Date` response header. NOT pure (it reads the system clock); typed as
+#@ pure for FFI ergonomics, matching the rest of our bridge surface.
 @external("erlang", "SagaHttp.bridge", "current_http_date")
 pub fun current_http_date : Unit -> String
 
 # -- Types --
 
+#@ HTTP versions this library accepts. Anything else (HTTP/0.9, HTTP/2.0,
+#@ malformed) is rejected at the parser with 505 — handlers never see it.
 pub type HttpVersion = Http1_0 | Http1_1 deriving (Debug, Eq)
 
-# RFC 9112 §3.2 request-target forms. `path` on `Request` is still derived
-# from this (path portion for Origin/Absolute, the authority string for
-# Authority, "*" for Asterisk) so existing handlers that only look at
-# `req.path` keep working; new code can match on `req.target` directly.
+#@ RFC 9112 §3.2 request-target forms. `path` on `Request` is still derived
+#@ from this (path portion for Origin/Absolute, the authority string for
+#@ Authority, "*" for Asterisk) so existing handlers that only look at
+#@ `req.path` keep working; new code can match on `req.target` directly.
 pub type RequestTarget =
   | Origin String (Maybe String)
   | Absolute String
@@ -43,6 +62,9 @@ pub type RequestTarget =
   | Asterisk
   deriving (Debug, Eq)
 
+#@ Parsed HTTP request handed to user code. Header names are lowercased;
+#@ `body` is `Just` for requests with a Content-Length or chunked body and
+#@ `Nothing` otherwise; `peer` is resolved once per connection.
 pub record Request {
   method: String,
   path: String,
@@ -59,15 +81,24 @@ pub record Request {
   peer: (String, Int),
 }
 
+#@ Effect available inside a `Streamed` response producer. Each `write_chunk!`
+#@ emits one Transfer-Encoding chunk; the zero-chunk terminator is sent
+#@ automatically when the producer returns.
 pub effect Chunked {
   fun write_chunk : BitString -> Unit
 }
 
+#@ How a `Response` body is delivered. `Buffered`/`BufferedBytes` are sent as
+#@ a single Content-Length response; `Streamed` switches the response to
+#@ `Transfer-Encoding: chunked` and runs the producer to generate chunks.
 pub type ResponseBody =
   | Buffered String
   | BufferedBytes BitString
   | Streamed (Unit -> Unit needs {Chunked})
 
+#@ Outgoing response. Build directly or use the `text` / `bytes` / `stream`
+#@ constructors. `Date` and `Server` are injected at send time unless the
+#@ user has set them already (case-insensitive).
 pub record Response {
   status: Int,
   # User-provided case is preserved on the wire. Multiple entries with
@@ -77,6 +108,8 @@ pub record Response {
   body: ResponseBody,
 }
 
+#@ Reasons `parse_request` can fail. Each maps to a canned response in the
+#@ default connection loop: 400, 413, 417, 505, 408 respectively.
 pub type ParseError =
   | BadRequest
   | PayloadTooLarge
@@ -85,9 +118,9 @@ pub type ParseError =
   | BodyReadTimeout
   deriving (Debug, Eq)
 
-# Identifies which `Tcp.send` failed inside a `SendFailed` event so consumers
-# can distinguish, say, "lost the client mid-stream" from "couldn't even
-# send the response head."
+#@ Identifies which `Tcp.send` failed inside a `SendFailed` event so consumers
+#@ can distinguish, say, "lost the client mid-stream" from "couldn't even
+#@ send the response head."
 pub type SendSite =
   | SendResponse
   | SendChunk
@@ -95,9 +128,9 @@ pub type SendSite =
   | SendContinue
   deriving (Debug, Eq)
 
-# Server-side observability events. Consumers attach a `Server` handler at
-# the `serve` boundary to log/metric/discard. Events cover the cases where
-# we previously dropped errors silently or `dbg`'d them inline.
+#@ Server-side observability events. Consumers attach a `Server` handler at
+#@ the `serve` boundary to log/metric/discard. Events cover the cases where
+#@ we previously dropped errors silently or `dbg`'d them inline.
 pub type ServerEvent =
   | AcceptError String # accept() returned an error; loop continues
   | ClientDisconnected # peer closed during the initial header read
@@ -114,19 +147,23 @@ pub type ServerEvent =
   | PeerAddressUnavailable String # Tcp.peername failed at connection setup; req.peer falls back to ("", 0)
   deriving (Debug)
 
+#@ Observability effect. Every `serve` invocation needs a `Server` handler
+#@ in scope; the runtime emits a `ServerEvent` whenever something happens
+#@ outside the happy path (parse errors, send failures, timeouts, …).
+#@ `discard_events` and `print_events` are ready-made handlers.
 pub effect Server {
   fun event : ServerEvent -> Unit
 }
 
-# Default no-op handler. Consumers in tests and benchmarks reach for this
-# when they don't care about events.
+#@ Default no-op handler. Consumers in tests and benchmarks reach for this
+#@ when they don't care about events.
 pub handler discard_events for Server {
   event _ = resume ()
 }
 
-# Debug handler that prints every event via `dbg`. Useful in `Main.saga`
-# during development; not appropriate for production where structured
-# logging or a metrics export is wanted instead.
+#@ Debug handler that prints every event via `dbg`. Useful in `Main.saga`
+#@ during development; not appropriate for production where structured
+#@ logging or a metrics export is wanted instead.
 pub handler print_events for Server {
   event e = {
     dbg e
@@ -139,6 +176,9 @@ type HeaderReadError =
   | HeaderReadClosed
   | HeaderReadTimeout
 
+#@ Tunables for a `serve` call. Most consumers start from `default_config`
+#@ and override fields with record-update syntax. See the per-field comments
+#@ below and `docs/library-guide.md` for grouped descriptions.
 pub record Config {
   port: Int,
   max_body_size: Int,
@@ -183,6 +223,9 @@ pub record Config {
   max_header_count: Int,
 }
 
+#@ Sensible defaults for local/internal deployments. Port 8080, 1MiB body
+#@ cap, 30s idle/read timeouts, 60s total body deadline, 10000 max
+#@ connections. Override with `{ default_config | field: ... }`.
 pub val default_config = Config {
   port: 8080,
   max_body_size: 1048576,
@@ -200,9 +243,9 @@ pub val default_config = Config {
 
 # -- Header helpers --
 
-# First value matching `name`, case-insensitive. Returns Nothing if
-# the header isn't present. Use `find_all_headers` when a header may
-# legitimately appear more than once (e.g. `Set-Cookie`).
+#@ First value matching `name`, case-insensitive. Returns Nothing if
+#@ the header isn't present. Use `find_all_headers` when a header may
+#@ legitimately appear more than once (e.g. `Set-Cookie`).
 pub fun find_header : String -> List (String, String) -> Maybe String
 find_header name headers = find_header_loop (String.to_lower name) headers
 
@@ -212,9 +255,9 @@ find_header_loop target ((n, v) :: rest) =
   if String.to_lower n == target then Just v
   else find_header_loop target rest
 
-# All values matching `name`, in the order they appear. Useful for
-# headers that may legitimately repeat (`Set-Cookie`, `Cache-Control`,
-# `Vary`, etc.).
+#@ All values matching `name`, in the order they appear. Useful for
+#@ headers that may legitimately repeat (`Set-Cookie`, `Cache-Control`,
+#@ `Vary`, etc.).
 pub fun find_all_headers : String -> List (String, String) -> List String
 find_all_headers name headers = {
   let target = String.to_lower name
@@ -225,9 +268,9 @@ find_all_headers name headers = {
   }) headers
 }
 
-# Replace any existing entries with this name (case-insensitively),
-# appending the new entry at the end. Used by encoders to set
-# server-controlled headers like Content-Length.
+#@ Replace any existing entries with this name (case-insensitively),
+#@ appending the new entry at the end. Used by encoders to set
+#@ server-controlled headers like Content-Length.
 pub fun replace_header : String -> String -> List (String, String) -> List (String, String)
 replace_header name value headers = {
   let target = String.to_lower name
@@ -239,8 +282,8 @@ replace_header name value headers = {
   List.append kept [(name, value)]
 }
 
-# Append `(name, value)` only if no entry with this name (case-insensitively)
-# already exists. Used for headers we want to default but let the user override.
+#@ Append `(name, value)` only if no entry with this name (case-insensitively)
+#@ already exists. Used for headers we want to default but let the user override.
 pub fun set_default_header : String -> String -> List (String, String) -> List (String, String)
 set_default_header name value headers = case find_header name headers {
   Just _ -> headers
@@ -249,6 +292,7 @@ set_default_header name value headers = case find_header name headers {
 
 # -- Response helpers --
 
+#@ Build a buffered text response with `Content-Type: text/plain`.
 pub fun text : Int -> String -> Response
 text status body = Response {
   status: status,
@@ -256,9 +300,9 @@ text status body = Response {
   body: Buffered body,
 }
 
-# Buffered binary response. Unlike `text`, no Content-Type is defaulted —
-# binary payloads vary (image/png, application/octet-stream, etc.), and
-# guessing here would be worse than forcing the caller to be explicit.
+#@ Buffered binary response. Unlike `text`, no Content-Type is defaulted —
+#@ binary payloads vary (image/png, application/octet-stream, etc.), and
+#@ guessing here would be worse than forcing the caller to be explicit.
 pub fun bytes : Int -> List (String, String) -> BitString -> Response
 bytes status headers body = Response {
   status: status,
@@ -266,6 +310,9 @@ bytes status headers body = Response {
   body: BufferedBytes body,
 }
 
+#@ Build a chunked-streaming response. The producer runs after the response
+#@ head is sent; each `write_chunk!` flushes one chunk to the socket. Any
+#@ user-provided `Content-Length` is stripped (chunked framing replaces it).
 pub fun stream : Int -> List (String, String) -> (Unit -> Unit needs {Chunked}) -> Response
 stream status headers producer = Response {
   status: status,
@@ -273,6 +320,9 @@ stream status headers producer = Response {
   body: Streamed producer,
 }
 
+#@ Standard reason phrase for an HTTP status code. Covers the codes this
+#@ library emits itself plus a handful of common ones; returns `"Unknown"`
+#@ for codes not in the table. Wrap if you need exhaustive coverage.
 pub fun status_text : Int -> String
 status_text code = case code {
   100 -> "Continue"
@@ -346,6 +396,10 @@ sanitize_bytes bs acc = case bs {
   }
 }
 
+#@ Render a header list to its on-the-wire form (each line ending in CRLF,
+#@ no trailing blank line). Names that aren't valid HTTP tokens are dropped;
+#@ CR/LF in values is replaced with space. Mainly an implementation detail
+#@ of `send_response`, but exposed for callers building responses by hand.
 pub fun encode_headers : List (String, String) -> String
 encode_headers headers =
   headers
@@ -359,8 +413,8 @@ encode_headers headers =
     else acc
   }) ""
 
-# Pure: encodes a buffered response as a single BitString.
-# Panics if called with a Streamed response — use send_response instead.
+#@ Pure: encodes a buffered response as a single BitString.
+#@ Panics if called with a Streamed response — use send_response instead.
 pub fun encode_response : (method: String) -> Response -> BitString
 encode_response method resp = case resp.body {
   Buffered body ->
@@ -401,12 +455,11 @@ encode_streamed_head version status headers = {
     <> "\r\n")
 }
 
-# Drop every entry with this name, case-insensitively.
+#@ Drop every entry with this name, case-insensitively.
 pub fun remove_header : String -> List (String, String) -> List (String, String)
 remove_header name headers = {
   let target = String.to_lower name
-  List.filter (fun pair -> {
-    let (n, _) = pair
+  List.filter (fun (n, _) -> {
     String.to_lower n != target
   }) headers
 }
@@ -444,8 +497,11 @@ inject_server_headers config headers = {
   else set_default_header "Server" config.server_name with_date
 }
 
-# Sends a response over the socket, choosing the buffered or chunked
-# wire format based on the body variant.
+#@ Send a response on `socket`, choosing buffered or chunked framing based
+#@ on `resp.body`. Injects `Date` and `Server` (unless already present),
+#@ computes Content-Length for buffered bodies, and runs the producer for
+#@ streamed bodies. For HEAD requests, only the head is sent. Errors are
+#@ reported via `SendFailed` events; this function does not return them.
 pub fun send_response : Config -> Tcp.Socket -> HttpVersion -> String -> Response -> Unit
   needs {Server}
 send_response config socket version method resp = {
@@ -472,6 +528,9 @@ send_response config socket version method resp = {
   }
 }
 
+#@ Canned error responses used by the default connection loop when parsing
+#@ fails. All carry `Connection: close`. Reach for these when running your
+#@ own loop and you need to short-circuit before reaching a handler.
 pub val bad_request = Response {
   status: 400,
   headers: [("Content-Type", "text/plain"), ("Connection", "close")],
@@ -504,6 +563,8 @@ pub val version_not_supported = Response {
 
 # -- Request parsing --
 
+#@ Validate the `(major, minor)` tuple from the request line. Only 1.0 and
+#@ 1.1 are accepted; anything else returns `UnsupportedVersion` (→ 505).
 pub fun parse_version : (Int, Int) -> Result HttpVersion ParseError
 parse_version v = case v {
   (1, 1) -> Ok Http1_1
@@ -511,10 +572,10 @@ parse_version v = case v {
   _ -> Err UnsupportedVersion
 }
 
-# Parse the raw request-target string per RFC 9112 §3.2. The bridge hands
-# us the target verbatim; the four forms are distinguished syntactically
-# and constrained by method (asterisk-form is OPTIONS-only, authority-form
-# is CONNECT-only).
+#@ Parse the raw request-target string per RFC 9112 §3.2. The bridge hands
+#@ us the target verbatim; the four forms are distinguished syntactically
+#@ and constrained by method (asterisk-form is OPTIONS-only, authority-form
+#@ is CONNECT-only).
 pub fun parse_target : String -> String -> Result RequestTarget ParseError
 parse_target method target = {
   let bs = BitString.from_string target
@@ -571,9 +632,9 @@ target_path t = case t {
   Asterisk -> "*"
 }
 
-# Returns the parsed Request along with any leftover bytes after the body
-# (a non-empty leftover indicates a pipelined follow-up request, which we
-# don't support — the caller should close the connection).
+#@ Returns the parsed Request along with any leftover bytes after the body
+#@ (a non-empty leftover indicates a pipelined follow-up request, which we
+#@ don't support — the caller should close the connection).
 pub fun parse_request : Config -> Tcp.Socket -> (String, Int) -> BitString -> Result (Request, BitString) ParseError
   needs {Server}
 parse_request config socket peer input = do {
@@ -626,8 +687,8 @@ maybe_send_continue socket version headers = case find_header "expect" headers {
     }
 }
 
-# Builds the headers list in reverse to keep insertion O(1), then reverses
-# at the end so the wire-order is preserved for the user.
+#@ Builds the headers list in reverse to keep insertion O(1), then reverses
+#@ at the end so the wire-order is preserved for the user.
 pub fun decode_headers : Config -> List (String, String) -> BitString -> Result (List (String, String), BitString) ParseError
 decode_headers config acc input = case decode_header input config.max_header_size {
   Ok (Header key value rest) -> {
@@ -639,10 +700,10 @@ decode_headers config acc input = case decode_header input config.max_header_siz
   Err _ -> Err BadRequest
 }
 
-# Returns the parsed body (if any) along with any bytes that remained
-# in the buffer after the body. Callers should treat non-empty leftover
-# as a pipelined-request signal and close the connection (we don't
-# support pipelining — see docs/planning/http1.md).
+#@ Returns the parsed body (if any) along with any bytes that remained
+#@ in the buffer after the body. Callers should treat non-empty leftover
+#@ as a pipelined-request signal and close the connection (we don't
+#@ support pipelining — see docs/planning/http1.md).
 pub fun read_body : Config -> Tcp.Socket -> List (String, String) -> BitString -> Result (Maybe BitString, BitString) ParseError
   needs {Server}
 read_body config socket headers rest = case validate_framing headers {
@@ -814,8 +875,8 @@ read_until_headers_complete config socket buf timeout = case header_section_size
     }
 }
 
-# Parse a chunk-size line: leading hex digits, optionally followed by
-# chunk extensions (";name=value"). Returns Nothing if no hex digits.
+#@ Parse a chunk-size line: leading hex digits, optionally followed by
+#@ chunk extensions (";name=value"). Returns Nothing if no hex digits.
 pub fun parse_chunk_size : BitString -> Maybe Int
 parse_chunk_size bs = parse_hex_loop bs 0 0
 
@@ -927,6 +988,9 @@ read_chunk_body config socket buf acc size deadline =
 
 # -- Server --
 
+#@ Decide whether to reuse the connection after this request. Honours the
+#@ `Connection` header tokens (`close`, `keep-alive`); falls back to the
+#@ version default (HTTP/1.1: keep-alive, HTTP/1.0: close).
 pub fun should_keep_alive : Request -> Bool
 should_keep_alive req = case find_header "connection" req.headers {
   Just v -> {
@@ -953,8 +1017,12 @@ connection_tokens v =
   |> List.map String.trim
   |> List.map String.to_lower
 
-# Reads requests in a loop until the client disconnects, times out,
-# or the connection should close.
+#@ Run the full request/response loop on an accepted socket: resolve the
+#@ peer once, then read → parse → invoke `on_request` → send → loop while
+#@ the connection is keep-alive. Handles every error path internally
+#@ (parse errors, timeouts, disconnects, pipelining) and closes the socket
+#@ before returning. Used by `serve`; usable directly if you're running
+#@ your own listener.
 pub fun handle_connection : Config -> Tcp.Socket -> (Request -> Response) -> Unit
   needs {Server}
 handle_connection config socket on_request = {
@@ -1045,10 +1113,14 @@ type SupMsg =
 
 opaque type ShutdownHandle = ShutdownHandle (Pid SupMsg)
 
+#@ Outcome of `shutdown_and_wait`. `Drained` is the happy path; `TimedOut`
+#@ means the deadline fired before all handlers exited (the count is on
+#@ the corresponding `ShutdownTimedOut` event); `NoReply` means the
+#@ supervisor died unexpectedly or never responded.
 pub type ShutdownResult =
   | Drained
-  | TimedOut # deadline fired with connections still alive; count is reported via `ShutdownTimedOut` event
-  | NoReply # supervisor died for an unexpected reason
+  | TimedOut
+  | NoReply
   deriving (Debug, Eq)
 
 # Acceptor: blocks on Tcp.accept, forwards each new socket to the supervisor.
@@ -1095,13 +1167,6 @@ fun supervisor_loop : Config -> Tcp.ListenSocket -> (Request -> Response) -> Lis
   needs {Process, Actor SupMsg, Monitor, Timer, Server}
 supervisor_loop config listener on_request conns = receive {
   NewConnection sock ->
-    # Backpressure: cap concurrent connections at `max_connections`. The
-    # acceptor keeps accepting (simpler than a pause/resume protocol);
-    # the supervisor sheds load by closing the new socket immediately.
-    # Trade-off: every over-cap connection still costs an accept + a
-    # round trip through the supervisor mailbox before we drop it. If
-    # that becomes a hotspot, push the cap check into the acceptor and
-    # have the supervisor signal it when capacity returns.
     if List.length conns >= config.max_connections then {
       event! ConnectionLimitReached
       Tcp.close sock
@@ -1170,6 +1235,11 @@ drain_loop active deadline_ms = receive {
   }
 }
 
+#@ Start the server. Non-blocking: opens the listener, spawns supervisor +
+#@ acceptor, returns a `ShutdownHandle`. The caller is expected to keep its
+#@ process alive (typically via `await_shutdown`) so the supervisor isn't
+#@ orphaned. Returns `Err` with a gen_tcp reason if `listen` fails or the
+#@ initial controlling-process transfer fails.
 pub fun serve : Config -> (Request -> Response) -> Result ShutdownHandle String
   needs {Process, Actor SupMsg, Monitor, Timer, Server}
 serve config on_request = case Tcp.listen config.port 1024 {
@@ -1194,13 +1264,13 @@ serve config on_request = case Tcp.listen config.port 1024 {
   }
 }
 
-# Synchronous shutdown. Sends the shutdown signal, monitors the supervisor,
-# waits for it to die, decodes the result from its exit reason. The caller's
-# mailbox type is unconstrained — `Down` system messages match any `Actor msg`.
-#
-# `deadline_ms` is the supervisor's drain deadline. `shutdown_and_wait` itself
-# adds a small grace period on top so a non-responsive supervisor still
-# returns `NoReply` instead of hanging.
+#@ Synchronous shutdown. Sends the shutdown signal, monitors the supervisor,
+#@ waits for it to die, decodes the result from its exit reason. The caller's
+#@ mailbox type is unconstrained — `Down` system messages match any `Actor msg`.
+#@
+#@ `deadline_ms` is the supervisor's drain deadline. `shutdown_and_wait` itself
+#@ adds a small grace period on top so a non-responsive supervisor still
+#@ returns `NoReply` instead of hanging.
 pub fun shutdown_and_wait : ShutdownHandle -> Int -> ShutdownResult
   needs {Process, Actor msg, Monitor}
 shutdown_and_wait (ShutdownHandle sup) deadline_ms = {
@@ -1216,10 +1286,10 @@ shutdown_and_wait (ShutdownHandle sup) deadline_ms = {
   }
 }
 
-# Blocks the caller until the server's supervisor exits. Useful in `main`
-# so the executable doesn't return immediately after `serve`. Returns
-# normally on any supervisor exit reason — callers that care about the
-# distinction should use `shutdown_and_wait` instead.
+#@ Blocks the caller until the server's supervisor exits. Useful in `main`
+#@ so the executable doesn't return immediately after `serve`. Returns
+#@ normally on any supervisor exit reason — callers that care about the
+#@ distinction should use `shutdown_and_wait` instead.
 pub fun await_shutdown : ShutdownHandle -> Unit needs {Actor msg, Monitor}
 await_shutdown (ShutdownHandle sup) = {
   let _ref = monitor! sup
