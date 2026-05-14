@@ -3,4 +3,6 @@ deps/
 erl_crash.dump
 .direnv
 
+bench/node_modules
+
 .DS_Store
