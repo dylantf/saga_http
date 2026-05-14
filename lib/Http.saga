@@ -609,33 +609,39 @@ read_content_length_bytes config socket buf len =
 
 # -- Chunked transfer encoding (request) --
 
-# Locate the first CRLF in `bs`, returning (before, after). O(n^2) but
-# only used on short lines (chunk-size and trailers, both bounded).
+# Locate the first CRLF in `bs`, returning (before, after). Single pass:
+# walk byte-by-byte to find the index, then split once at the end. Erlang
+# sub-binaries are reference slices, not copies, so each recursive step is
+# O(1) and the whole scan is O(n).
 fun find_crlf : BitString -> Maybe (BitString, BitString)
-find_crlf bs = find_crlf_at bs 0
-
-fun find_crlf_at : BitString -> Int -> Maybe (BitString, BitString)
-find_crlf_at bs i =
-  if i + 2 > BitString.size bs then Nothing
-  else case bs {
+find_crlf bs = case find_crlf_index bs 0 {
+  Nothing -> Nothing
+  Just i -> case bs {
     <<head:i/binary, "\r\n", rest/binary>> -> Just (head, rest)
-    _ -> find_crlf_at bs (i + 1)
+    _ -> Nothing
   }
+}
+
+fun find_crlf_index : BitString -> Int -> Maybe Int
+find_crlf_index bs i = case bs {
+  <<"\r\n", _/binary>> -> Just i
+  <<_:8, rest/binary>> -> find_crlf_index rest (i + 1)
+  _ -> Nothing
+}
 
 # Finds the end-of-headers marker ("\r\n\r\n"), returning the size of
 # the header section including the marker. We return a size rather than
 # Bool so the cumulative header cap is enforced even when one recv brings
 # in a complete oversized header block (possibly followed by body bytes).
 fun header_section_size : BitString -> Maybe Int
-header_section_size bs = header_section_size_at bs 0
+header_section_size bs = header_section_size_loop bs 0
 
-fun header_section_size_at : BitString -> Int -> Maybe Int
-header_section_size_at bs i =
-  if i + 4 > BitString.size bs then Nothing
-  else case bs {
-    <<_:i/binary, "\r\n\r\n", _/binary>> -> Just (i + 4)
-    _ -> header_section_size_at bs (i + 1)
-  }
+fun header_section_size_loop : BitString -> Int -> Maybe Int
+header_section_size_loop bs i = case bs {
+  <<"\r\n\r\n", _/binary>> -> Just (i + 4)
+  <<_:8, rest/binary>> -> header_section_size_loop rest (i + 1)
+  _ -> Nothing
+}
 
 # Reads from the socket until the buffer contains the end-of-headers
 # marker (\r\n\r\n). Bails with BadRequest if the headers grow past

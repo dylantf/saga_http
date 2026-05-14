@@ -476,6 +476,27 @@ tests () = {
       }
     })
 
+    test "large but valid header block (under cap) is accepted" (fun () -> {
+      # ~50 headers of ~1KB each = ~50KB, under the 64KB max_request_headers_size
+      # default. Acts as a canary against an O(n^2) regression in the header-
+      # boundary scanner: under the old quadratic scan this would noticeably
+      # slow down the test; if a future change reintroduces it, this should
+      # show up in test timing even without a hard deadline.
+      let padding = String.repeat 1000 "x"
+      let headers = String.repeat 50 $"X-Filler: {padding}\r\n"
+      # Connection: close so the server closes after the response and our
+      # recv_all helper returns immediately rather than waiting out its
+      # 5s read timeout.
+      let req = $"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\r\n"
+      case request req {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "path: /test" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
     test "conflicting Content-Length headers return 400 (smuggling defense)" (fun () -> {
       let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello"
       case request req {
