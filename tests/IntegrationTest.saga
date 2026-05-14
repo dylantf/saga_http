@@ -21,6 +21,7 @@ handle req =
     write_chunk! (BitString.from_string "alpha")
     write_chunk! (BitString.from_string "beta")
   })
+  else if req.path == "/bytes" then Http.bytes 200 [("Content-Type", "application/octet-stream")] <<0, 255, 128, 1, 254>>
   else if req.path
     == "/cookies" then Response {
     status: 200,
@@ -54,6 +55,19 @@ fun recv_all : Tcp.Socket -> BitString -> Result BitString String
 recv_all sock acc = case Tcp.recv sock 0 5000 {
   Ok more -> recv_all sock (acc <> more)
   Err _ -> if BitString.size acc == 0 then Err "no data" else Ok acc
+}
+
+# Like `request`, but returns the raw response bytes so non-UTF8 bodies
+# round-trip exactly.
+fun request_bytes : String -> Result BitString String
+request_bytes raw = case Tcp.connect "127.0.0.1" test_port 5000 {
+  Err e -> Err e
+  Ok sock -> {
+    let _ = Tcp.send sock (BitString.from_string raw)
+    let r = recv_all sock <<>>
+    let _ = Tcp.close sock
+    r
+  }
 }
 
 # Send raw bytes on a fresh connection, return the response as a String.
@@ -95,6 +109,28 @@ two_requests first second = case Tcp.connect "127.0.0.1" test_port 5000 {
       }
     }
   }
+}
+
+# Split a raw HTTP response into (head-as-String, body-as-BitString) at the
+# first \r\n\r\n. Useful when the body is binary and can't go through
+# BitString.to_string.
+fun split_head_body : BitString -> Maybe (String, BitString)
+split_head_body bs = case find_eoh_index bs 0 {
+  Nothing -> Nothing
+  Just i -> case bs {
+    <<head:i/binary, "\r\n\r\n", body/binary>> -> case BitString.to_string head {
+      Ok s -> Just (s, body)
+      Err _ -> Nothing
+    }
+    _ -> Nothing
+  }
+}
+
+fun find_eoh_index : BitString -> Int -> Maybe Int
+find_eoh_index bs i = case bs {
+  <<"\r\n\r\n", _/binary>> -> Just i
+  <<_:8, rest/binary>> -> find_eoh_index rest (i + 1)
+  _ -> Nothing
 }
 
 fun assert_contains : String -> String -> Unit needs {Test}
@@ -557,6 +593,22 @@ tests () = {
           assert_contains "5\r\nalpha\r\n" r
           assert_contains "4\r\nbeta\r\n" r
           assert_contains "0\r\n\r\n" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "BufferedBytes response: non-UTF8 body round-trips with correct Content-Length" (fun () -> {
+      let expected_body = <<0, 255, 128, 1, 254>>
+      case request_bytes "GET /bytes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
+        Ok bs -> case split_head_body bs {
+          Just (head_str, body) -> {
+            assert_contains "HTTP/1.1 200 OK" head_str
+            assert_contains "Content-Length: 5" head_str
+            assert_contains "Content-Type: application/octet-stream" head_str
+            assert_eq body expected_body
+          }
+          Nothing -> assert_true False
         }
         Err _ -> assert_true False
       }

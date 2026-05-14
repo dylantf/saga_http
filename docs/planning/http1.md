@@ -77,18 +77,24 @@
 - [ ] WebSockets
 - [ ] Optional HTTP pipelining support - only if a real use case appears; current policy is close-on-detected-pipelining
 
-## Framework ergonomics
+## Request metadata
 
-- [ ] Router helper - route by method/path with path parameters
-- [ ] Query string parser - expose parsed query params
-- [ ] Request metadata - peer address, local address, scheme, and raw target where useful
-- [ ] Header builder helpers - safer typed helpers for common response headers: content type, cache control, redirects, cookies
-- [ ] Cookie helpers - parse request cookies and build `Set-Cookie`
-- [ ] JSON helpers - optional request/response convenience once Saga has the right ecosystem pieces
-- [ ] Static file response helper - content type detection, range policy decision, cache headers
+- [ ] Peer address on `Request` - expose `Tcp.peername` so handlers can see the connecting client (logging, IP-based decisions). Local address and scheme can follow if there's demand.
 
 ## Documentation
 
 - [ ] Supported HTTP/1.1 subset - document no pipelining, transfer-encoding scope, trailer behavior, request target forms, and parser limits
 - [ ] Security limits and defaults - document body size, per-line header size, cumulative header size, trailer size, read timeout, and idle timeout
 - [ ] Deployment stance - spell out that the current server is suitable for local/internal/behind-proxy use, not yet as a hardened public edge server
+
+## Out of scope (framework / router concerns)
+
+This is a low-level HTTP library: parse a request off a socket, build a response, write it back. The following belong in a router or framework built on top, not here:
+
+- Routing (method/path matching, path parameters, route trees)
+- Query string parsing - exposing `?foo=bar` as a parsed `Dict` of key/value pairs
+- Cookie parsing and `Set-Cookie` builders
+- Typed header builder helpers (Content-Type sugar, redirect helpers, cache-control DSLs, etc.)
+- JSON request/response helpers
+- Static file serving (content-type detection, range requests, cache headers)
+- Sessions, CSRF tokens, signed cookies, auth middleware

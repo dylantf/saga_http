@@ -48,6 +48,7 @@ pub effect Chunked {
 
 pub type ResponseBody =
   | Buffered String
+  | BufferedBytes BitString
   | Streamed (Unit -> Unit needs {Chunked})
 
 pub record Response {
@@ -217,6 +218,16 @@ text status body = Response {
   body: Buffered body,
 }
 
+# Buffered binary response. Unlike `text`, no Content-Type is defaulted —
+# binary payloads vary (image/png, application/octet-stream, etc.), and
+# guessing here would be worse than forcing the caller to be explicit.
+pub fun bytes : Int -> List (String, String) -> BitString -> Response
+bytes status headers body = Response {
+  status: status,
+  headers: headers,
+  body: BufferedBytes body,
+}
+
 pub fun stream : Int -> List (String, String) -> (Unit -> Unit needs {Chunked}) -> Response
 stream status headers producer = Response {
   status: status,
@@ -313,6 +324,8 @@ encode_headers headers =
 pub fun encode_response : (method: String) -> Response -> BitString
 encode_response method resp = case resp.body {
   Buffered body ->
+    encode_buffered_bytes Http1_1 method resp.status resp.headers (BitString.from_string body)
+  BufferedBytes body ->
     encode_buffered_bytes Http1_1 method resp.status resp.headers body
   Streamed _ ->
     panic "encode_response: cannot encode a Streamed response, use send_response"
@@ -324,16 +337,16 @@ response_version_text version = case version {
   Http1_1 -> "HTTP/1.1"
 }
 
-fun encode_buffered_bytes : HttpVersion -> String -> Int -> List (String, String) -> String -> BitString
+fun encode_buffered_bytes : HttpVersion -> String -> Int -> List (String, String) -> BitString -> BitString
 encode_buffered_bytes version method status headers body = {
-  let body_len = show (String.byte_size body)
+  let body_len = show (BitString.size body)
   let headers = replace_header "Content-Length" body_len headers
   let head = $"{response_version_text version} {show status} {status_text status}\r\n"
     <> encode_headers headers
     <> "\r\n"
   let head_bits = BitString.from_string head
   if method == "HEAD" then head_bits
-  else head_bits <> BitString.from_string body
+  else head_bits <> body
 }
 
 fun encode_streamed_head : HttpVersion -> Int -> List (String, String) -> BitString
@@ -398,7 +411,11 @@ pub fun send_response : Config -> Tcp.Socket -> HttpVersion -> String -> Respons
 send_response config socket version method resp = {
   let headers = inject_server_headers config resp.headers
   case resp.body {
-    Buffered body -> case Tcp.send socket (encode_buffered_bytes version method resp.status headers body) {
+    Buffered body -> case Tcp.send socket (encode_buffered_bytes version method resp.status headers (BitString.from_string body)) {
+      Ok _ -> ()
+      Err e -> event! (SendFailed SendResponse e)
+    }
+    BufferedBytes body -> case Tcp.send socket (encode_buffered_bytes version method resp.status headers body) {
       Ok _ -> ()
       Err e -> event! (SendFailed SendResponse e)
     }
