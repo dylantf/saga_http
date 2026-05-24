@@ -6,7 +6,7 @@ Low-level HTTP/1.1 server: request parsing, response encoding, connection lifecy
 
 Consumers typically reach for `serve` plus a `Request -> Response`
 handler; routers, effectful handlers, and anything more elaborate live
-in libraries built on top. See `docs/library-guide.md` for a how-to-use
+in libraries built on top. See `docs/guide/` for a how-to-use
 overview and `docs/planning/http1.md` for the roadmap and explicit
 scope decisions.
 
@@ -167,7 +167,7 @@ record Config {
 
 Tunables for a `serve` call. Most consumers start from `default_config`
 and override fields with record-update syntax. See the per-field comments
-below and `docs/library-guide.md` for grouped descriptions.
+below and `docs/guide/configuration.md` for grouped descriptions.
 
 ### ShutdownHandle
 

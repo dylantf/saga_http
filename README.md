@@ -44,7 +44,7 @@ main () = {
 } with {beam_actor, print_events}
 ```
 
-See the [library guide](./docs/library-guide.md) for more.
+See the [guide](./docs/guide/getting-started.md) for more.
 
 ## Modules
 
@@ -53,5 +53,5 @@ See the [library guide](./docs/library-guide.md) for more.
 
 ## Documentation
 
-- [Library guide](./docs/library-guide.md)
-- [API reference](./docs/library/)
+- [Guide](./docs/guide/getting-started.md)
+- [API reference](./docs/reference/)

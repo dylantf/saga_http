@@ -1,0 +1,40 @@
+{
+  "sections": [
+    {
+      "slug": "getting-started",
+      "title": "Getting started",
+      "description": "What saga_http is for, a minimal serve example, and the scope boundary against routers and frameworks.",
+      "group": "guide"
+    },
+    {
+      "slug": "requests",
+      "title": "Requests",
+      "description": "The Request record, RequestTarget forms, header lookup, body buffering, and peer resolution.",
+      "group": "guide"
+    },
+    {
+      "slug": "responses",
+      "title": "Responses",
+      "description": "The Response record, text/bytes/stream constructors, chunked streaming, header sanitization, and canned error responses.",
+      "group": "guide"
+    },
+    {
+      "slug": "lifecycle",
+      "title": "Server lifecycle",
+      "description": "serve, await_shutdown, shutdown_and_wait, and the Server effect with its event variants and ready-made handlers.",
+      "group": "guide"
+    },
+    {
+      "slug": "configuration",
+      "title": "Configuration",
+      "description": "Config fields grouped by identity, framing limits, timeouts, and capacity.",
+      "group": "guide"
+    },
+    {
+      "slug": "recipes",
+      "title": "Architectural recipes",
+      "description": "Recipe A: a pure router on top of serve. Recipe B: a custom connection loop using parse_request and send_response.",
+      "group": "guide"
+    }
+  ]
+}
