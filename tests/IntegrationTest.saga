@@ -7,14 +7,22 @@ import SagaHttp.Http
 import SagaHttp.Http (Chunked, Server, discard_events)
 import SagaHttp.Tcp
 
-val test_port = 18765
-val idle_test_port = 18766
-val events_test_port = 18767
-val shutdown_test_port = 18768
-val shutdown_drain_port = 18769
-val shutdown_timeout_port = 18770
-val body_deadline_port = 18771
-val max_conns_port = 18772
+fun test_port : Int
+test_port = 18765
+fun idle_test_port : Int
+idle_test_port = 18766
+fun events_test_port : Int
+events_test_port = 18767
+fun shutdown_test_port : Int
+shutdown_test_port = 18768
+fun shutdown_drain_port : Int
+shutdown_drain_port = 18769
+fun shutdown_timeout_port : Int
+shutdown_timeout_port = 18770
+fun body_deadline_port : Int
+body_deadline_port = 18771
+fun max_conns_port : Int
+max_conns_port = 18772
 
 fun target_label : Http.RequestTarget -> String
 target_label t = case t {

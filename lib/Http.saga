@@ -226,7 +226,8 @@ pub record Config {
 #@ Sensible defaults for local/internal deployments. Port 8080, 1MiB body
 #@ cap, 30s idle/read timeouts, 60s total body deadline, 10000 max
 #@ connections. Override with `{ default_config | field: ... }`.
-pub val default_config = Config {
+pub fun default_config : Config
+default_config = Config {
   port: 8080,
   max_body_size: 1048576,
   max_header_size: 8192,
@@ -531,31 +532,36 @@ send_response config socket version method resp = {
 #@ Canned error responses used by the default connection loop when parsing
 #@ fails. All carry `Connection: close`. Reach for these when running your
 #@ own loop and you need to short-circuit before reaching a handler.
-pub val bad_request = Response {
+pub fun bad_request : Response
+bad_request = Response {
   status: 400,
   headers: [("Content-Type", "text/plain"), ("Connection", "close")],
   body: Buffered "Bad Request",
 }
 
-pub val request_timeout = Response {
+pub fun request_timeout : Response
+request_timeout = Response {
   status: 408,
   headers: [("Content-Type", "text/plain"), ("Connection", "close")],
   body: Buffered "Request Timeout",
 }
 
-pub val payload_too_large = Response {
+pub fun payload_too_large : Response
+payload_too_large = Response {
   status: 413,
   headers: [("Content-Type", "text/plain"), ("Connection", "close")],
   body: Buffered "Payload Too Large",
 }
 
-pub val expectation_failed = Response {
+pub fun expectation_failed : Response
+expectation_failed = Response {
   status: 417,
   headers: [("Content-Type", "text/plain"), ("Connection", "close")],
   body: Buffered "Expectation Failed",
 }
 
-pub val version_not_supported = Response {
+pub fun version_not_supported : Response
+version_not_supported = Response {
   status: 505,
   headers: [("Content-Type", "text/plain"), ("Connection", "close")],
   body: Buffered "HTTP Version Not Supported",

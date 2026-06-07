@@ -72,11 +72,11 @@ yourself (case-insensitively). Set `Config.server_name = ""` to omit
 For when you need to short-circuit:
 
 ```saga
-pub val bad_request           # 400, Connection: close
-pub val request_timeout       # 408, Connection: close
-pub val payload_too_large     # 413, Connection: close
-pub val expectation_failed    # 417, Connection: close
-pub val version_not_supported # 505, Connection: close
+pub fun bad_request           # 400, Connection: close
+pub fun request_timeout       # 408, Connection: close
+pub fun payload_too_large     # 413, Connection: close
+pub fun expectation_failed    # 417, Connection: close
+pub fun version_not_supported # 505, Connection: close
 ```
 
 These are values, not functions. The parser uses the same set when it

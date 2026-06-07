@@ -47,7 +47,7 @@ type RequestTarget =
 
 RFC 9112 §3.2 request-target forms. `path` on `Request` is still derived
 from this (path portion for Origin/Absolute, the authority string for
-Authority, "*" for Asterisk) so existing handlers that only look at
+Authority, "\*" for Asterisk) so existing handlers that only look at
 `req.path` keep working; new code can match on `req.target` directly.
 
 ### Request
@@ -242,7 +242,7 @@ logging or a metrics export is wanted instead.
 ### default_config
 
 ```saga
-val default_config
+pub fun default_config : Config
 ```
 
 Sensible defaults for local/internal deployments. Port 8080, 1MiB body
@@ -252,7 +252,7 @@ connections. Override with `{ default_config | field: ... }`.
 ### bad_request
 
 ```saga
-val bad_request
+pub fun bad_request : Int
 ```
 
 Canned error responses used by the default connection loop when parsing
@@ -262,25 +262,25 @@ own loop and you need to short-circuit before reaching a handler.
 ### request_timeout
 
 ```saga
-val request_timeout
+pub fun request_timeout : Int
 ```
 
 ### payload_too_large
 
 ```saga
-val payload_too_large
+pub fun payload_too_large : Int
 ```
 
 ### expectation_failed
 
 ```saga
-val expectation_failed
+pub fun expectation_failed : Int
 ```
 
 ### version_not_supported
 
 ```saga
-val version_not_supported
+pub fun version_not_supported : Int
 ```
 
 ## Functions
@@ -549,4 +549,3 @@ Blocks the caller until the server's supervisor exits. Useful in `main`
 so the executable doesn't return immediately after `serve`. Returns
 normally on any supervisor exit reason — callers that care about the
 distinction should use `shutdown_and_wait` instead.
-
