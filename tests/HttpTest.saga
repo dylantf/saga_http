@@ -11,8 +11,7 @@ import Std.Test (
   assert_ok,
   assert_err
 )
-import SagaHttp.Http
-import SagaHttp.Http (Chunked, Server)
+import SagaHttp.Http (Request, Chunked, Server)
 
 fun req_with : Http.HttpVersion -> List (String, String) -> Http.Request
 req_with version headers = Request {

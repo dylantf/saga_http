@@ -3,8 +3,7 @@ module IntegrationTest
 import Std.Actor (Process, Actor, Monitor, Timer, beam_actor)
 import Std.BitString
 import Std.Test (Testing, Test, describe, test, assert_true, assert_eq)
-import SagaHttp.Http
-import SagaHttp.Http (Chunked, Server, discard_events)
+import SagaHttp.Http (Response, Chunked, Server, discard_events)
 import SagaHttp.Tcp
 
 fun test_port : Int
@@ -40,7 +39,10 @@ handle req =
     write_chunk! (BitString.from_string "alpha")
     write_chunk! (BitString.from_string "beta")
   })
-  else if req.path == "/bytes" then Http.bytes 200 [("Content-Type", "application/octet-stream")] <<0, 255, 128, 1, 254>>
+  else if req.path
+    == "/bytes" then Http.bytes 200 [
+    ("Content-Type", "application/octet-stream"),
+  ] <<0, 255, 128, 1, 254>>
   else if req.path == "/peer" then {
     let (ip, port) = req.peer
     Http.text 200 $"peer: {ip}:{show port}"
@@ -60,7 +62,8 @@ handle req =
       Ok s -> Http.text 200 $"echo: {s}"
       Err _ -> Http.text 500 "binary body"
     }
-    Nothing -> Http.text 200 $"path: {req.path} target: {target_label req.target}"
+    Nothing ->
+      Http.text 200 $"path: {req.path} target: {target_label req.target}"
   }
 
 # Convert a received BitString to a String for assertion. Tests only use
@@ -109,7 +112,9 @@ request raw = case Tcp.connect "127.0.0.1" test_port 5000 {
 }
 
 # Send two requests on a single connection, returning each response separately.
-fun two_requests : String -> String -> Result (String, Result String String) String
+fun two_requests : String
+  -> String
+  -> Result (String, Result String String) String
 two_requests first second = case Tcp.connect "127.0.0.1" test_port 5000 {
   Err e -> Err e
   Ok sock -> {
@@ -170,7 +175,7 @@ tests () = {
         ()
       })
       sleep! 200
-    } with { beam_actor, discard_events }
+    } with {beam_actor, discard_events}
 
     test "peer address is exposed on Request" (fun () -> {
       case request "GET /peer HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" {
@@ -381,7 +386,8 @@ tests () = {
     # Method is currently accepted as any HTTP token. Document via test:
     # unknown methods reach `handle`, invalid characters are rejected at parse.
     test "unknown but valid method is accepted (token methods pass through)" (fun () -> {
-      let req = "BREW /coffee HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+      let req =
+        "BREW /coffee HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
       case request req {
         Ok r -> assert_contains "HTTP/1.1 200 OK" r
         Err _ -> assert_true False
@@ -389,9 +395,9 @@ tests () = {
     })
 
     test "method with invalid character returns 400" (fun () -> {
-      let req =
-        BitString.from_string "GE" <> <<0>>
-          <> BitString.from_string "T /foo HTTP/1.1\r\nHost: localhost\r\n\r\n"
+      let req = BitString.from_string "GE"
+        <> <<0>>
+        <> BitString.from_string "T /foo HTTP/1.1\r\nHost: localhost\r\n\r\n"
       case Tcp.connect "127.0.0.1" test_port 5000 {
         Err _ -> assert_true False
         Ok sock -> {
@@ -399,7 +405,8 @@ tests () = {
           let r = recv_all sock <<>>
           let _ = Tcp.close sock
           case r {
-            Ok bs -> assert_contains "HTTP/1.1 400 Bad Request" (resp_to_string bs)
+            Ok bs ->
+              assert_contains "HTTP/1.1 400 Bad Request" (resp_to_string bs)
             Err _ -> assert_true False
           }
         }
@@ -510,7 +517,8 @@ tests () = {
       let result = {
         # Start a second server on a different port with a 100ms idle timeout.
         let _ = spawn! (fun () -> {
-          let cfg = { Http.default_config | port: idle_test_port, idle_timeout_ms: 100 }
+          let cfg =
+            { Http.default_config | port: idle_test_port, idle_timeout_ms: 100 }
           let _ = Http.serve cfg handle
           ()
         })
@@ -519,7 +527,8 @@ tests () = {
         case Tcp.connect "127.0.0.1" idle_test_port 5000 {
           Err _ -> False
           Ok sock -> {
-            let _ = Tcp.send sock (BitString.from_string "GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            let _ =
+              Tcp.send sock (BitString.from_string "GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
             let r1 = Tcp.recv sock 0 5000
             # Wait past the idle timeout, then the next recv should fail
             # because the server timed us out and closed the connection.
@@ -532,7 +541,7 @@ tests () = {
             }
           }
         }
-      } with { beam_actor, discard_events }
+      } with {beam_actor, discard_events}
       assert_true result
     })
 
@@ -575,8 +584,10 @@ tests () = {
         case Tcp.connect "127.0.0.1" test_port 5000 {
           Err _ -> Err "connect"
           Ok sock -> {
-            let first = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhe"
-            let second = "lloGET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            let first =
+              "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhe"
+            let second =
+              "lloGET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
             let _ = Tcp.send sock (BitString.from_string first)
             sleep! 50
             let _ = Tcp.send sock (BitString.from_string second)
@@ -609,9 +620,11 @@ tests () = {
         case Tcp.connect "127.0.0.1" test_port 5000 {
           Err _ -> Err "connect"
           Ok sock -> {
-            let _ = Tcp.send sock (BitString.from_string "GET /test HTTP/1.1\r\n")
+            let _ =
+              Tcp.send sock (BitString.from_string "GET /test HTTP/1.1\r\n")
             sleep! 50
-            let _ = Tcp.send sock (BitString.from_string "Host: localhost\r\nConnection: close\r\n\r\n")
+            let _ =
+              Tcp.send sock (BitString.from_string "Host: localhost\r\nConnection: close\r\n\r\n")
             let r = recv_all sock <<>>
             let _ = Tcp.close sock
             case r {
@@ -653,7 +666,8 @@ tests () = {
       # Connection: close so the server closes after the response and our
       # recv_all helper returns immediately rather than waiting out its
       # 5s read timeout.
-      let req = $"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\r\n"
+      let req =
+        $"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\r\n"
       case request req {
         Ok r -> {
           assert_contains "HTTP/1.1 200 OK" r
@@ -664,7 +678,8 @@ tests () = {
     })
 
     test "conflicting Content-Length headers return 400 (smuggling defense)" (fun () -> {
-      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello"
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello"
       case request req {
         Ok r -> assert_contains "HTTP/1.1 400 Bad Request" r
         Err _ -> assert_true False
@@ -672,7 +687,8 @@ tests () = {
     })
 
     test "duplicate identical Content-Length headers are accepted" (fun () -> {
-      let req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+      let req =
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
       case request req {
         Ok r -> {
           assert_contains "HTTP/1.1 200 OK" r
@@ -760,7 +776,7 @@ tests () = {
           event e = {
             send! me e
             resume ()
-          },
+          }
         })
         sleep! 100
 
@@ -864,11 +880,11 @@ tests () = {
         case Http.serve cfg handle {
           Err _ -> Http.NoReply
           Ok h -> {
-            sleep! 50  # let the supervisor settle
+            sleep! 50 # let the supervisor settle
             Http.shutdown_and_wait h 1000
           }
         }
-      } with { beam_actor, discard_events }
+      } with {beam_actor, discard_events}
       assert_eq result Http.Drained
     })
 
@@ -891,8 +907,8 @@ tests () = {
                 # socket open. The connection process is now in its
                 # 30s idle keep-alive wait. With force-close on shutdown
                 # we should still drain quickly.
-                let _ = Tcp.send sock (BitString.from_string
-                  "GET /hold HTTP/1.1\r\nHost: x\r\n\r\n")
+                let _ =
+                  Tcp.send sock (BitString.from_string "GET /hold HTTP/1.1\r\nHost: x\r\n\r\n")
                 let _ = Tcp.recv sock 0 1000
 
                 # 200ms deadline. Without force-close this would TimedOut.
@@ -903,7 +919,7 @@ tests () = {
             }
           }
         }
-      } with { beam_actor, discard_events }
+      } with {beam_actor, discard_events}
       assert_eq result Http.Drained
     })
 
@@ -914,11 +930,12 @@ tests () = {
       let result = {
         let me = self! ()
         let _ = spawn! (fun () -> {
-          let cfg = { Http.default_config |
-            port: body_deadline_port,
-            read_timeout_ms: 5000,
-            total_body_timeout_ms: 200,
-          }
+          let cfg =
+            { Http.default_config |
+              port: body_deadline_port,
+              read_timeout_ms: 5000,
+              total_body_timeout_ms: 200,
+            }
           let _ = Http.serve cfg handle
           ()
         } with {
@@ -926,15 +943,15 @@ tests () = {
           event e = {
             send! me e
             resume ()
-          },
+          }
         })
         sleep! 100
 
         let resp = case Tcp.connect "127.0.0.1" body_deadline_port 5000 {
           Err _ -> Err "connect"
           Ok sock -> {
-            let _ = Tcp.send sock (BitString.from_string
-              "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
+            let _ =
+              Tcp.send sock (BitString.from_string "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
             # Send 5 bytes, well below CL 1000, then sleep past the deadline.
             # Per-recv keeps refreshing under read_timeout_ms; the cumulative
             # deadline is what trips.
@@ -961,7 +978,8 @@ tests () = {
       let result = {
         let me = self! ()
         let _ = spawn! (fun () -> {
-          let cfg = { Http.default_config | port: max_conns_port, max_connections: 2 }
+          let cfg =
+            { Http.default_config | port: max_conns_port, max_connections: 2 }
           let _ = Http.serve cfg handle
           ()
         } with {
@@ -969,7 +987,7 @@ tests () = {
           event e = {
             send! me e
             resume ()
-          },
+          }
         })
         sleep! 100
 
@@ -994,8 +1012,14 @@ tests () = {
           }
         }
 
-        let _ = case s1 { Ok sock -> Tcp.close sock; _ -> () }
-        let _ = case s2 { Ok sock -> Tcp.close sock; _ -> () }
+        let _ = case s1 {
+          Ok sock -> Tcp.close sock
+          _ -> ()
+        }
+        let _ = case s2 {
+          Ok sock -> Tcp.close sock
+          _ -> ()
+        }
 
         (third_closed, drain_for_limit_event 10)
       } with beam_actor
@@ -1022,8 +1046,8 @@ tests () = {
             let resp = case Tcp.connect "127.0.0.1" shutdown_drain_port 5000 {
               Err _ -> Err "connect"
               Ok sock -> {
-                let _ = Tcp.send sock (BitString.from_string
-                  "GET /drain HTTP/1.1\r\nHost: x\r\n\r\n")
+                let _ =
+                  Tcp.send sock (BitString.from_string "GET /drain HTTP/1.1\r\nHost: x\r\n\r\n")
                 let r = Tcp.recv sock 0 1000
                 let _ = Tcp.close sock
                 case r {
@@ -1037,10 +1061,16 @@ tests () = {
             # close the listener, then drain the existing connection process
             # (which exits when the client closed its socket above).
             let s = Http.shutdown_and_wait h 2000
-            (s, case resp { Ok r -> r; Err _ -> "no-resp" })
+            (
+              s,
+              case resp {
+                Ok r -> r
+                Err _ -> "no-resp"
+              },
+            )
           }
         }
-      } with { beam_actor, discard_events }
+      } with {beam_actor, discard_events}
       let (status, body) = result
       assert_eq status Http.Drained
       assert_contains "path: /drain" body

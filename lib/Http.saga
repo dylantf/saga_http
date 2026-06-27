@@ -32,12 +32,16 @@ pub type HeaderResult =
 #@ `(method, target, (major, minor), rest)`. `max_size` caps the request
 #@ line length; longer lines fail (→ 400 in the default loop).
 @external("erlang", "SagaHttp.bridge", "decode_request_line")
-pub fun decode_request_line : (data: BitString) -> (max_size: Int) -> Result (String, String, (Int, Int), BitString) String
+pub fun decode_request_line : (data: BitString)
+  -> (max_size: Int)
+  -> Result (String, String, (Int, Int), BitString) String
 
 #@ Parse one header line off the front of `data`. See `HeaderResult`.
 #@ `max_size` caps the line length.
 @external("erlang", "SagaHttp.bridge", "decode_header")
-pub fun decode_header : (data: BitString) -> (max_size: Int) -> Result HeaderResult String
+pub fun decode_header : (data: BitString)
+  -> (max_size: Int)
+  -> Result HeaderResult String
 
 #@ Returns the current UTC time as an IMF-fixdate string suitable for the
 #@ `Date` response header. NOT pure (it reads the system clock); typed as
@@ -272,7 +276,10 @@ find_all_headers name headers = {
 #@ Replace any existing entries with this name (case-insensitively),
 #@ appending the new entry at the end. Used by encoders to set
 #@ server-controlled headers like Content-Length.
-pub fun replace_header : String -> String -> List (String, String) -> List (String, String)
+pub fun replace_header : String
+  -> String
+  -> List (String, String)
+  -> List (String, String)
 replace_header name value headers = {
   let target = String.to_lower name
   let kept =
@@ -285,7 +292,10 @@ replace_header name value headers = {
 
 #@ Append `(name, value)` only if no entry with this name (case-insensitively)
 #@ already exists. Used for headers we want to default but let the user override.
-pub fun set_default_header : String -> String -> List (String, String) -> List (String, String)
+pub fun set_default_header : String
+  -> String
+  -> List (String, String)
+  -> List (String, String)
 set_default_header name value headers = case find_header name headers {
   Just _ -> headers
   Nothing -> List.append headers [(name, value)]
@@ -314,7 +324,10 @@ bytes status headers body = Response {
 #@ Build a chunked-streaming response. The producer runs after the response
 #@ head is sent; each `write_chunk!` flushes one chunk to the socket. Any
 #@ user-provided `Content-Length` is stripped (chunked framing replaces it).
-pub fun stream : Int -> List (String, String) -> (Unit -> Unit needs {Chunked}) -> Response
+pub fun stream : Int
+  -> List (String, String)
+  -> (Unit -> Unit needs {Chunked})
+  -> Response
 stream status headers producer = Response {
   status: status,
   headers: headers,
@@ -432,7 +445,12 @@ response_version_text version = case version {
   Http1_1 -> "HTTP/1.1"
 }
 
-fun encode_buffered_bytes : HttpVersion -> String -> Int -> List (String, String) -> BitString -> BitString
+fun encode_buffered_bytes : HttpVersion
+  -> String
+  -> Int
+  -> List (String, String)
+  -> BitString
+  -> BitString
 encode_buffered_bytes version method status headers body = {
   let body_len = show (BitString.size body)
   let headers = replace_header "Content-Length" body_len headers
@@ -444,7 +462,10 @@ encode_buffered_bytes version method status headers body = {
   else head_bits <> body
 }
 
-fun encode_streamed_head : HttpVersion -> Int -> List (String, String) -> BitString
+fun encode_streamed_head : HttpVersion
+  -> Int
+  -> List (String, String)
+  -> BitString
 encode_streamed_head version status headers = {
   # A streamed response is framed by Transfer-Encoding: chunked alone;
   # mixing in a Content-Length is a protocol violation that confuses
@@ -491,7 +512,9 @@ chunked_socket socket = handler for Chunked needs {Server} {
 # Adds the server-controlled `Date` and `Server` response headers
 # unless the user already set them. Server is omitted entirely when
 # `config.server_name` is the empty string.
-fun inject_server_headers : Config -> List (String, String) -> List (String, String)
+fun inject_server_headers : Config
+  -> List (String, String)
+  -> List (String, String)
 inject_server_headers config headers = {
   let with_date = set_default_header "Date" (current_http_date ()) headers
   if config.server_name == "" then with_date
@@ -503,7 +526,12 @@ inject_server_headers config headers = {
 #@ computes Content-Length for buffered bodies, and runs the producer for
 #@ streamed bodies. For HEAD requests, only the head is sent. Errors are
 #@ reported via `SendFailed` events; this function does not return them.
-pub fun send_response : Config -> Tcp.Socket -> HttpVersion -> String -> Response -> Unit
+pub fun send_response : Config
+  -> Tcp.Socket
+  -> HttpVersion
+  -> String
+  -> Response
+  -> Unit
   needs {Server}
 send_response config socket version method resp = {
   let headers = inject_server_headers config resp.headers
@@ -641,7 +669,11 @@ target_path t = case t {
 #@ Returns the parsed Request along with any leftover bytes after the body
 #@ (a non-empty leftover indicates a pipelined follow-up request, which we
 #@ don't support — the caller should close the connection).
-pub fun parse_request : Config -> Tcp.Socket -> (String, Int) -> BitString -> Result (Request, BitString) ParseError
+pub fun parse_request : Config
+  -> Tcp.Socket
+  -> (String, Int)
+  -> BitString
+  -> Result (Request, BitString) ParseError
   needs {Server}
 parse_request config socket peer input = do {
   Ok (method, raw_target, version_tuple, rest) <- decode_request_line input config.max_header_size
@@ -675,7 +707,10 @@ parse_request config socket peer input = do {
 # the server replies with `100 Continue` to signal it's willing to read the
 # body. Any other Expect value is rejected with 417. HTTP/1.0 clients don't
 # understand 100 Continue, so we ignore the header for them.
-fun maybe_send_continue : Tcp.Socket -> HttpVersion -> List (String, String) -> Result Unit ParseError
+fun maybe_send_continue : Tcp.Socket
+  -> HttpVersion
+  -> List (String, String)
+  -> Result Unit ParseError
   needs {Server}
 maybe_send_continue socket version headers = case find_header "expect" headers {
   Nothing -> Ok ()
@@ -695,7 +730,10 @@ maybe_send_continue socket version headers = case find_header "expect" headers {
 
 #@ Builds the headers list in reverse to keep insertion O(1), then reverses
 #@ at the end so the wire-order is preserved for the user.
-pub fun decode_headers : Config -> List (String, String) -> BitString -> Result (List (String, String), BitString) ParseError
+pub fun decode_headers : Config
+  -> List (String, String)
+  -> BitString
+  -> Result (List (String, String), BitString) ParseError
 decode_headers config acc input = case decode_header input config.max_header_size {
   Ok (Header key value rest) -> {
     let next = (String.to_lower key, value) :: acc
@@ -710,7 +748,11 @@ decode_headers config acc input = case decode_header input config.max_header_siz
 #@ in the buffer after the body. Callers should treat non-empty leftover
 #@ as a pipelined-request signal and close the connection (we don't
 #@ support pipelining — see docs/planning/http1.md).
-pub fun read_body : Config -> Tcp.Socket -> List (String, String) -> BitString -> Result (Maybe BitString, BitString) ParseError
+pub fun read_body : Config
+  -> Tcp.Socket
+  -> List (String, String)
+  -> BitString
+  -> Result (Maybe BitString, BitString) ParseError
   needs {Server}
 read_body config socket headers rest = case validate_framing headers {
   Err e -> Err e
@@ -741,7 +783,9 @@ read_body config socket headers rest = case validate_framing headers {
   }
 }
 
-fun validate_body_framing : Config -> List (String, String) -> Result Unit ParseError
+fun validate_body_framing : Config
+  -> List (String, String)
+  -> Result Unit ParseError
 validate_body_framing config headers = case validate_framing headers {
   Err e -> Err e
   Ok _ -> {
@@ -787,7 +831,12 @@ validate_framing headers = case find_all_headers "transfer-encoding" headers {
   }
 }
 
-fun read_with_content_length : Config -> Tcp.Socket -> BitString -> String -> Int -> Result (Maybe BitString, BitString) ParseError
+fun read_with_content_length : Config
+  -> Tcp.Socket
+  -> BitString
+  -> String
+  -> Int
+  -> Result (Maybe BitString, BitString) ParseError
   needs {Server}
 read_with_content_length config socket rest len_str deadline = case Int.parse len_str {
   Nothing -> Err BadRequest
@@ -800,7 +849,12 @@ read_with_content_length config socket rest len_str deadline = case Int.parse le
     else read_content_length_bytes config socket rest len deadline
 }
 
-fun read_content_length_bytes : Config -> Tcp.Socket -> BitString -> Int -> Int -> Result (Maybe BitString, BitString) ParseError
+fun read_content_length_bytes : Config
+  -> Tcp.Socket
+  -> BitString
+  -> Int
+  -> Int
+  -> Result (Maybe BitString, BitString) ParseError
   needs {Server}
 read_content_length_bytes config socket buf len deadline =
   if BitString.size buf >= len then case buf {
@@ -863,7 +917,11 @@ header_section_size_loop bs i = case bs {
 # a keep-alive connection); subsequent reads use the read timeout.
 # Distinguishes Closed (clean peer close) from Timeout so callers can
 # emit different observability events for each.
-fun read_until_headers_complete : Config -> Tcp.Socket -> BitString -> Int -> Result BitString HeaderReadError
+fun read_until_headers_complete : Config
+  -> Tcp.Socket
+  -> BitString
+  -> Int
+  -> Result BitString HeaderReadError
 read_until_headers_complete config socket buf timeout = case header_section_size buf {
   Just size ->
     if size > config.max_request_headers_size then Err HeaderReadBadRequest
@@ -905,7 +963,12 @@ parse_hex_loop bs acc count = case bs {
 # Reads from the socket until `buf` contains a CRLF, returning
 # (line_without_crlf, rest_after_crlf). Bails if the line would exceed
 # `max_size`, to avoid unbounded reads on malicious input.
-fun read_line : Tcp.Socket -> BitString -> Int -> Int -> Int -> Result (BitString, BitString) ParseError
+fun read_line : Tcp.Socket
+  -> BitString
+  -> Int
+  -> Int
+  -> Int
+  -> Result (BitString, BitString) ParseError
   needs {Server}
 read_line socket buf max_size timeout deadline = case find_crlf buf {
   Just split -> Ok split
@@ -925,7 +988,12 @@ read_line socket buf max_size timeout deadline = case find_crlf buf {
 }
 
 # Ensures `buf` contains at least `n` bytes, returning (first_n, rest).
-fun read_n : Tcp.Socket -> BitString -> Int -> Int -> Int -> Result (BitString, BitString) ParseError
+fun read_n : Tcp.Socket
+  -> BitString
+  -> Int
+  -> Int
+  -> Int
+  -> Result (BitString, BitString) ParseError
   needs {Server}
 read_n socket buf n timeout deadline =
   if BitString.size buf >= n then case buf {
@@ -945,12 +1013,21 @@ read_n socket buf n timeout deadline =
   }
 
 # Discards trailer headers up to and including the terminating empty line.
-fun consume_trailers : Config -> Tcp.Socket -> BitString -> Int -> Result BitString ParseError
+fun consume_trailers : Config
+  -> Tcp.Socket
+  -> BitString
+  -> Int
+  -> Result BitString ParseError
   needs {Server}
 consume_trailers config socket buf deadline =
   consume_trailers_loop config socket buf 0 deadline
 
-fun consume_trailers_loop : Config -> Tcp.Socket -> BitString -> Int -> Int -> Result BitString ParseError
+fun consume_trailers_loop : Config
+  -> Tcp.Socket
+  -> BitString
+  -> Int
+  -> Int
+  -> Result BitString ParseError
   needs {Server}
 consume_trailers_loop config socket buf used deadline = case read_line socket buf config.max_trailer_size config.read_timeout_ms deadline {
   Err e -> Err e
@@ -963,7 +1040,12 @@ consume_trailers_loop config socket buf used deadline = case read_line socket bu
       + 2) deadline
 }
 
-fun read_chunked : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Result (BitString, BitString) ParseError
+fun read_chunked : Config
+  -> Tcp.Socket
+  -> BitString
+  -> BitString
+  -> Int
+  -> Result (BitString, BitString) ParseError
   needs {Server}
 read_chunked config socket buf acc deadline = case read_line socket buf config.max_chunk_line_size config.read_timeout_ms deadline {
   Err e -> Err e
@@ -973,7 +1055,13 @@ read_chunked config socket buf acc deadline = case read_line socket buf config.m
   }
 }
 
-fun read_chunk_body : Config -> Tcp.Socket -> BitString -> BitString -> Int -> Int -> Result (BitString, BitString) ParseError
+fun read_chunk_body : Config
+  -> Tcp.Socket
+  -> BitString
+  -> BitString
+  -> Int
+  -> Int
+  -> Result (BitString, BitString) ParseError
   needs {Server}
 read_chunk_body config socket buf acc 0 deadline = case consume_trailers config socket buf deadline {
   Err e -> Err e
@@ -1029,7 +1117,10 @@ connection_tokens v =
 #@ (parse errors, timeouts, disconnects, pipelining) and closes the socket
 #@ before returning. Used by `serve`; usable directly if you're running
 #@ your own listener.
-pub fun handle_connection : Config -> Tcp.Socket -> (Request -> Response) -> Unit
+pub fun handle_connection : Config
+  -> Tcp.Socket
+  -> (Request -> Response)
+  -> Unit
   needs {Server}
 handle_connection config socket on_request = {
   # `peername` is stable for the life of the socket, so we resolve it once
@@ -1044,7 +1135,11 @@ handle_connection config socket on_request = {
   handle_connection_loop config socket peer on_request
 }
 
-fun handle_connection_loop : Config -> Tcp.Socket -> (String, Int) -> (Request -> Response) -> Unit
+fun handle_connection_loop : Config
+  -> Tcp.Socket
+  -> (String, Int)
+  -> (Request -> Response)
+  -> Unit
   needs {Server}
 handle_connection_loop config socket peer on_request = case read_until_headers_complete config socket <<>> config.idle_timeout_ms {
   Err HeaderReadClosed -> {
@@ -1169,7 +1264,11 @@ acceptor_loop listener sup = case Tcp.accept listener {
 # connection at once. The list is kept tight by removing entries on
 # `Down`, so the supervisor's footprint stays proportional to live
 # connections, not cumulative.
-fun supervisor_loop : Config -> Tcp.ListenSocket -> (Request -> Response) -> List (Pid SupMsg, Tcp.Socket) -> Unit
+fun supervisor_loop : Config
+  -> Tcp.ListenSocket
+  -> (Request -> Response)
+  -> List (Pid SupMsg, Tcp.Socket)
+  -> Unit
   needs {Process, Actor SupMsg, Monitor, Timer, Server}
 supervisor_loop config listener on_request conns = receive {
   NewConnection sock ->
