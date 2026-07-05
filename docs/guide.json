@@ -19,6 +19,12 @@
       "group": "guide"
     },
     {
+      "slug": "websockets",
+      "title": "WebSockets",
+      "description": "HTTP upgrade helpers, the WebSocket effect, runtime options, protocol support, and concurrency contract.",
+      "group": "guide"
+    },
+    {
       "slug": "lifecycle",
       "title": "Server lifecycle",
       "description": "serve, await_shutdown, shutdown_and_wait, and the Server effect with its event variants and ready-made handlers.",

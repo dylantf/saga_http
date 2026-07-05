@@ -11,6 +11,7 @@ pub type ResponseBody =
   | Buffered String
   | BufferedBytes BitString
   | Streamed (Unit -> Unit needs {Chunked})
+  | WebSocketUpgrade WebSocket.Options (Unit -> Unit needs {WebSocket.WebSocket})
 ```
 
 You can build a `Response` directly, but the constructors cover the
@@ -51,6 +52,13 @@ not resumed, the connection is closed.
 `Chunked` is only in scope inside the `stream` producer. You cannot
 call `write_chunk!` from your top-level handler; the body has to be
 `Streamed` for it to be available.
+
+## WebSocket upgrades
+
+`WebSocketUpgrade` is constructed by `websocket` and `websocket_with`, not by
+ordinary response helpers. The connection loop sends `101 Switching Protocols`,
+runs the WebSocket callback, then closes the HTTP connection instead of
+returning to keep-alive handling. See [WebSockets](websockets.md).
 
 ## Header sanitization
 

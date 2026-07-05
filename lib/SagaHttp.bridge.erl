@@ -155,10 +155,12 @@ current_http_date() ->
     {{Year, Month, Day}, {Hour, Min, Sec}} = calendar:universal_time(),
     DayName = day_name(calendar:day_of_the_week(Year, Month, Day)),
     MonthName = month_name(Month),
-    iolist_to_binary(io_lib:format(
-        "~s, ~2..0w ~s ~4..0w ~2..0w:~2..0w:~2..0w GMT",
-        [DayName, Day, MonthName, Year, Hour, Min, Sec]
-    )).
+    iolist_to_binary(
+        io_lib:format(
+            "~s, ~2..0w ~s ~4..0w ~2..0w:~2..0w:~2..0w GMT",
+            [DayName, Day, MonthName, Year, Hour, Min, Sec]
+        )
+    ).
 
 day_name(1) -> "Mon";
 day_name(2) -> "Tue";
@@ -168,15 +170,15 @@ day_name(5) -> "Fri";
 day_name(6) -> "Sat";
 day_name(7) -> "Sun".
 
-month_name(1)  -> "Jan";
-month_name(2)  -> "Feb";
-month_name(3)  -> "Mar";
-month_name(4)  -> "Apr";
-month_name(5)  -> "May";
-month_name(6)  -> "Jun";
-month_name(7)  -> "Jul";
-month_name(8)  -> "Aug";
-month_name(9)  -> "Sep";
+month_name(1) -> "Jan";
+month_name(2) -> "Feb";
+month_name(3) -> "Mar";
+month_name(4) -> "Apr";
+month_name(5) -> "May";
+month_name(6) -> "Jun";
+month_name(7) -> "Jul";
+month_name(8) -> "Aug";
+month_name(9) -> "Sep";
 month_name(10) -> "Oct";
 month_name(11) -> "Nov";
 month_name(12) -> "Dec".

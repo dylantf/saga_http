@@ -7,7 +7,7 @@ module SagaHttp.WebSocket
 import Std.BitString
 import Std.Crypto
 import Std.Int
-import Std.Ref (MutRef, Ref, beam_ref)
+import Std.Ref (MutRef, Ref, ets_ref)
 import Std.String
 import SagaHttp.Tcp
 
@@ -340,7 +340,7 @@ run_connection_with options socket initial app = {
   let websocket = websocket_socket options socket state
   let _ = app () with websocket
   Tcp.close socket
-} with beam_ref
+} with ets_ref
 
 fun websocket_socket :
   Options -> Tcp.Socket -> MutRef RuntimeState -> Handler WebSocket

@@ -35,6 +35,11 @@ fun websocket_limit_port : Int
 websocket_limit_port = 18777
 fun websocket_close_error_port : Int
 websocket_close_error_port = 18778
+fun websocket_spawned_reader_port : Int
+websocket_spawned_reader_port = 18779
+
+type WebSocketReaderMsg =
+  | WebSocketReadResult (Result (Maybe WebSocket.Message) WebSocket.Error)
 
 fun target_label : Http.RequestTarget -> String
 target_label t = case t {
@@ -132,6 +137,34 @@ websocket_report_error_once () = case read_message! () {
   }
   _ -> ()
 }
+
+fun websocket_spawned_reader_once : Unit -> Unit needs {WebSocket}
+websocket_spawned_reader_once () = {
+  let owner = self! ()
+  let _ = spawn! (fun () -> {
+    let result = read_message! ()
+    send! owner (WebSocketReadResult result)
+  })
+  receive {
+    WebSocketReadResult (Ok (Just (WebSocket.TextMessage text))) -> {
+      let _ = send_text! ("spawned:" <> text)
+      ()
+    }
+    WebSocketReadResult (Ok (Just (WebSocket.BinaryMessage bytes))) -> {
+      let _ = send_binary! bytes
+      ()
+    }
+    WebSocketReadResult (Ok Nothing) -> ()
+    WebSocketReadResult (Err e) -> {
+      let _ = send_text! ("error:" <> debug e)
+      ()
+    }
+    after 1000 -> {
+      let _ = send_text! "timeout"
+      ()
+    }
+  }
+} with beam_actor
 
 fun run_websocket_server_once : Int -> (Unit -> Unit needs {WebSocket}) -> Unit
   needs {Process, Actor msg, Timer}
@@ -372,6 +405,24 @@ tests () = {
           Ok (frame, leftover) -> {
             assert_eq frame.opcode WebSocket.Text
             assert_eq (BitString.to_string frame.payload) (Ok "echo:Hi")
+            assert_eq leftover <<>>
+          }
+          Err _ -> assert_true False
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "WebSocket runtime state is available to spawned handler processes" (fun () -> {
+      let result = {
+        run_websocket_server_once websocket_spawned_reader_port websocket_spawned_reader_once
+        websocket_request websocket_spawned_reader_port <<129, 130, 55, 250, 33, 61, 127, 147>>
+      } with beam_actor
+      case result {
+        Ok bytes -> case WebSocket.decode_frame_with server_frame_options bytes {
+          Ok (frame, leftover) -> {
+            assert_eq frame.opcode WebSocket.Text
+            assert_eq (BitString.to_string frame.payload) (Ok "spawned:Hi")
             assert_eq leftover <<>>
           }
           Err _ -> assert_true False

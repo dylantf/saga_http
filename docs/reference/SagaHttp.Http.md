@@ -30,6 +30,7 @@ has terminated and `rest` is the start of the body.
 type HttpVersion =
   | Http1_0
   | Http1_1
+  deriving (Debug, Eq)
 ```
 
 HTTP versions this library accepts. Anything else (HTTP/0.9, HTTP/2.0,
@@ -43,11 +44,12 @@ type RequestTarget =
   | Absolute String
   | Authority String
   | Asterisk
+  deriving (Debug, Eq)
 ```
 
 RFC 9112 §3.2 request-target forms. `path` on `Request` is still derived
 from this (path portion for Origin/Absolute, the authority string for
-Authority, "\*" for Asterisk) so existing handlers that only look at
+Authority, "*" for Asterisk) so existing handlers that only look at
 `req.path` keep working; new code can match on `req.target` directly.
 
 ### Request
@@ -68,6 +70,23 @@ Parsed HTTP request handed to user code. Header names are lowercased;
 `body` is `Just` for requests with a Content-Length or chunked body and
 `Nothing` otherwise; `peer` is resolved once per connection.
 
+### StreamingRequest
+
+```saga
+record StreamingRequest {
+  method: String,
+  path: String,
+  target: RequestTarget,
+  version: HttpVersion,
+  headers: List (String, String),
+  peer: (String, Int)
+}
+```
+
+Parsed request head handed to streaming handlers before the request body
+has been fully read. Use the `BodyReader` effect inside the handler to
+consume the body incrementally.
+
 ### ResponseBody
 
 ```saga
@@ -75,6 +94,7 @@ type ResponseBody =
   | Buffered String
   | BufferedBytes BitString
   | Streamed (Unit -> Unit needs {Chunked})
+  | WebSocketUpgrade WebSocket.Options (Unit -> Unit needs {WebSocket.WebSocket})
 ```
 
 How a `Response` body is delivered. `Buffered`/`BufferedBytes` are sent as
@@ -95,6 +115,15 @@ Outgoing response. Build directly or use the `text` / `bytes` / `stream`
 constructors. `Date` and `Server` are injected at send time unless the
 user has set them already (case-insensitive).
 
+### ConnectionDisposition
+
+```saga
+type ConnectionDisposition =
+  | ResponseSent
+  | ConnectionClosed
+  deriving (Debug, Eq)
+```
+
 ### ParseError
 
 ```saga
@@ -104,6 +133,7 @@ type ParseError =
   | ExpectationFailed
   | UnsupportedVersion
   | BodyReadTimeout
+  deriving (Debug, Eq)
 ```
 
 Reasons `parse_request` can fail. Each maps to a canned response in the
@@ -117,6 +147,7 @@ type SendSite =
   | SendChunk
   | SendChunkTerminator
   | SendContinue
+  deriving (Debug, Eq)
 ```
 
 Identifies which `Tcp.send` failed inside a `SendFailed` event so consumers
@@ -140,6 +171,7 @@ type ServerEvent =
   | ConnectionLimitReached
   | ShutdownTimedOut Int
   | PeerAddressUnavailable String
+  deriving (Debug)
 ```
 
 Server-side observability events. Consumers attach a `Server` handler at
@@ -182,6 +214,7 @@ type ShutdownResult =
   | Drained
   | TimedOut
   | NoReply
+  deriving (Debug, Eq)
 ```
 
 Outcome of `shutdown_and_wait`. `Drained` is the happy path; `TimedOut`
@@ -202,6 +235,23 @@ effect Chunked {
 Effect available inside a `Streamed` response producer. Each `write_chunk!`
 emits one Transfer-Encoding chunk; the zero-chunk terminator is sent
 automatically when the producer returns.
+
+### BodyReader
+
+```saga
+effect BodyReader {
+  fun read_body_chunk : Unit -> Result (Maybe BitString) ParseError
+  fun read_body_all : Unit -> Result BitString ParseError
+  fun discard_body : Unit -> Result Unit ParseError
+}
+```
+
+Effect available inside a streaming request handler. `read_body_chunk!`
+returns `Ok (Just bytes)` for the next body chunk, `Ok Nothing` at end of
+body, and `Err` for malformed bodies, size-limit failures, or read timeout.
+`read_body_all!` buffers the remaining body for simple adapters; prefer
+chunked reads for large uploads. `discard_body!` drains the body so a
+keep-alive connection can be reused.
 
 ### Server
 
@@ -237,52 +287,6 @@ Debug handler that prints every event via `dbg`. Useful in `Main.saga`
 during development; not appropriate for production where structured
 logging or a metrics export is wanted instead.
 
-## Values
-
-### default_config
-
-```saga
-pub fun default_config : Config
-```
-
-Sensible defaults for local/internal deployments. Port 8080, 1MiB body
-cap, 30s idle/read timeouts, 60s total body deadline, 10000 max
-connections. Override with `{ default_config | field: ... }`.
-
-### bad_request
-
-```saga
-pub fun bad_request : Int
-```
-
-Canned error responses used by the default connection loop when parsing
-fails. All carry `Connection: close`. Reach for these when running your
-own loop and you need to short-circuit before reaching a handler.
-
-### request_timeout
-
-```saga
-pub fun request_timeout : Int
-```
-
-### payload_too_large
-
-```saga
-pub fun payload_too_large : Int
-```
-
-### expectation_failed
-
-```saga
-pub fun expectation_failed : Int
-```
-
-### version_not_supported
-
-```saga
-pub fun version_not_supported : Int
-```
-
 ## Functions
 
 ### decode_request_line
@@ -313,6 +317,16 @@ fun current_http_date : Unit -> String
 Returns the current UTC time as an IMF-fixdate string suitable for the
 `Date` response header. NOT pure (it reads the system clock); typed as
 pure for FFI ergonomics, matching the rest of our bridge surface.
+
+### default_config
+
+```saga
+fun default_config : Config
+```
+
+Sensible defaults for local/internal deployments. Port 8080, 1MiB body
+cap, 30s idle/read timeouts, 60s total body deadline, 10000 max
+connections. Override with `{ default_config | field: ... }`.
 
 ### find_header
 
@@ -381,6 +395,25 @@ Build a chunked-streaming response. The producer runs after the response
 head is sent; each `write_chunk!` flushes one chunk to the socket. Any
 user-provided `Content-Length` is stripped (chunked framing replaces it).
 
+### websocket
+
+```saga
+fun websocket : Request -> Unit -> Unit needs {WebSocket.WebSocket} -> Response
+```
+
+Build a WebSocket upgrade response for a validated HTTP request.
+
+Invalid upgrade requests become `400 Bad Request`. A valid response sends
+`101 Switching Protocols`, then runs `app` with the `WebSocket` effect.
+
+### websocket_with
+
+```saga
+fun websocket_with : WebSocket.Options -> Request -> Unit -> Unit needs {WebSocket.WebSocket} -> Response
+```
+
+Build a WebSocket upgrade response with explicit runtime options.
+
 ### status_text
 
 ```saga
@@ -422,7 +455,7 @@ Drop every entry with this name, case-insensitively.
 ### send_response
 
 ```saga
-fun send_response : Config -> Tcp.Socket -> HttpVersion -> String -> Response -> Unit needs {Server}
+fun send_response : Config -> Tcp.Socket -> HttpVersion -> String -> Response -> ConnectionDisposition needs {Server}
 ```
 
 Send a response on `socket`, choosing buffered or chunked framing based
@@ -430,6 +463,40 @@ on `resp.body`. Injects `Date` and `Server` (unless already present),
 computes Content-Length for buffered bodies, and runs the producer for
 streamed bodies. For HEAD requests, only the head is sent. Errors are
 reported via `SendFailed` events; this function does not return them.
+
+### bad_request
+
+```saga
+fun bad_request : Response
+```
+
+Canned error responses used by the default connection loop when parsing
+fails. All carry `Connection: close`. Reach for these when running your
+own loop and you need to short-circuit before reaching a handler.
+
+### request_timeout
+
+```saga
+fun request_timeout : Response
+```
+
+### payload_too_large
+
+```saga
+fun payload_too_large : Response
+```
+
+### expectation_failed
+
+```saga
+fun expectation_failed : Response
+```
+
+### version_not_supported
+
+```saga
+fun version_not_supported : Response
+```
 
 ### parse_version
 
@@ -454,7 +521,7 @@ is CONNECT-only).
 ### parse_request
 
 ```saga
-fun parse_request : Config -> Tcp.Socket -> (String, Int) -> BitString -> Result (Request, BitString) ParseError needs {Server}
+fun parse_request : (config: Config) -> (socket: Tcp.Socket) -> (peer: (String, Int)) -> (input: BitString) -> Result (Request, BitString) ParseError needs {Server}
 ```
 
 Returns the parsed Request along with any leftover bytes after the body
@@ -473,7 +540,7 @@ at the end so the wire-order is preserved for the user.
 ### read_body
 
 ```saga
-fun read_body : Config -> Tcp.Socket -> List (String, String) -> BitString -> Result (Maybe BitString, BitString) ParseError needs {Server}
+fun read_body : (config: Config) -> (socket: Tcp.Socket) -> (headers: List (String, String)) -> (buffer: BitString) -> Result (Maybe BitString, BitString) ParseError needs {Server}
 ```
 
 Returns the parsed body (if any) along with any bytes that remained
@@ -513,6 +580,16 @@ the connection is keep-alive. Handles every error path internally
 before returning. Used by `serve`; usable directly if you're running
 your own listener.
 
+### handle_streaming_connection
+
+```saga
+fun handle_streaming_connection : Config -> Tcp.Socket -> StreamingRequest -> Response needs {BodyReader} -> Unit needs {Ref, Server}
+```
+
+Run the request/response loop with headers-first request delivery. Handlers
+consume request bodies through the `BodyReader` effect. If a handler returns
+before reaching end-of-body, the response is sent and the connection closes.
+
 ### serve
 
 ```saga
@@ -524,6 +601,17 @@ acceptor, returns a `ShutdownHandle`. The caller is expected to keep its
 process alive (typically via `await_shutdown`) so the supervisor isn't
 orphaned. Returns `Err` with a gen_tcp reason if `listen` fails or the
 initial controlling-process transfer fails.
+
+### serve_streaming
+
+```saga
+fun serve_streaming : Config -> StreamingRequest -> Response needs {BodyReader} -> Result ShutdownHandle String needs {Process, Actor SupMsg, Monitor, Timer, Server}
+```
+
+Start a server whose handler receives request headers before the body is
+buffered. The handler can consume the body with the `BodyReader` effect.
+If the handler returns before consuming or discarding the body, the
+response is sent and the connection is closed.
 
 ### shutdown_and_wait
 
