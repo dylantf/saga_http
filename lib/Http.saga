@@ -666,6 +666,22 @@ target_path t = case t {
   Asterisk -> "*"
 }
 
+type BodyFraming =
+  | NoBody
+  | ContentLengthBody Int
+  | ChunkedBody
+
+record RequestHead {
+  method: String,
+  path: String,
+  target: RequestTarget,
+  version: HttpVersion,
+  headers: List (String, String),
+  body_framing: BodyFraming,
+  rest: BitString,
+  peer: (String, Int),
+}
+
 #@ Returns the parsed Request along with any leftover bytes after the body
 #@ (a non-empty leftover indicates a pipelined follow-up request, which we
 #@ don't support — the caller should close the connection).
@@ -676,25 +692,51 @@ pub fun parse_request : Config
   -> Result (Request, BitString) ParseError
   needs {Server}
 parse_request config socket peer input = do {
+  Ok head <- parse_request_head config socket peer input
+  Ok (body, leftover) <- read_body_from_head config socket head
+  Ok (
+    Request {
+      method: head.method,
+      path: head.path,
+      target: head.target,
+      version: head.version,
+      headers: head.headers,
+      body: body,
+      peer: head.peer,
+    },
+    leftover,
+  )
+} else {
+  Err PayloadTooLarge -> Err PayloadTooLarge
+  Err ExpectationFailed -> Err ExpectationFailed
+  Err UnsupportedVersion -> Err UnsupportedVersion
+  Err BodyReadTimeout -> Err BodyReadTimeout
+  _ -> Err BadRequest
+}
+
+fun parse_request_head : Config
+  -> Tcp.Socket
+  -> (String, Int)
+  -> BitString
+  -> Result RequestHead ParseError
+  needs {Server}
+parse_request_head config socket peer input = do {
   Ok (method, raw_target, version_tuple, rest) <- decode_request_line input config.max_header_size
   Ok version <- parse_version version_tuple
   Ok target <- parse_target method raw_target
   Ok (headers, rest) <- decode_headers config [] rest
-  Ok _ <- validate_body_framing config headers
+  Ok framing <- body_framing config headers
   Ok _ <- maybe_send_continue socket version headers
-  Ok (body, leftover) <- read_body config socket headers rest
-  Ok (
-    Request {
-      method: method,
-      path: target_path target,
-      target: target,
-      version: version,
-      headers: headers,
-      body: body,
-      peer: peer,
-    },
-    leftover,
-  )
+  Ok (RequestHead {
+    method: method,
+    path: target_path target,
+    target: target,
+    version: version,
+    headers: headers,
+    body_framing: framing,
+    rest: rest,
+    peer: peer,
+  })
 } else {
   Err PayloadTooLarge -> Err PayloadTooLarge
   Err ExpectationFailed -> Err ExpectationFailed
@@ -754,39 +796,42 @@ pub fun read_body : Config
   -> BitString
   -> Result (Maybe BitString, BitString) ParseError
   needs {Server}
-read_body config socket headers rest = case validate_framing headers {
+read_body config socket headers rest = case body_framing config headers {
   Err e -> Err e
-  Ok _ -> {
-    let te = case find_header "transfer-encoding" headers {
-      Just v -> Just (String.to_lower v)
-      Nothing -> Nothing
-    }
-    let cl = find_header "content-length" headers
-    let deadline = Time.monotonic_ms () + config.total_body_timeout_ms
-    case te {
-      Just te_val ->
-        if te_val != "chunked" then Err BadRequest
-        else case cl {
-          # Per RFC 7230, both TE and CL together is suspect: reject.
-          Just _ -> Err BadRequest
-          Nothing -> case read_chunked config socket rest <<>> deadline {
-            Ok (body, leftover) -> Ok (Just body, leftover)
-            Err e -> Err e
-          }
-        }
-      Nothing -> case cl {
-        Nothing -> Ok (Nothing, rest)
-        Just len_str ->
-          read_with_content_length config socket rest len_str deadline
-      }
+  Ok framing -> read_body_with_framing config socket framing rest
+}
+
+fun read_body_from_head : Config
+  -> Tcp.Socket
+  -> RequestHead
+  -> Result (Maybe BitString, BitString) ParseError
+  needs {Server}
+read_body_from_head config socket head =
+  read_body_with_framing config socket head.body_framing head.rest
+
+fun read_body_with_framing : Config
+  -> Tcp.Socket
+  -> BodyFraming
+  -> BitString
+  -> Result (Maybe BitString, BitString) ParseError
+  needs {Server}
+read_body_with_framing config socket framing rest = {
+  let deadline = Time.monotonic_ms () + config.total_body_timeout_ms
+  case framing {
+    NoBody -> Ok (Nothing, rest)
+    ContentLengthBody len ->
+      read_content_length_bytes config socket rest len deadline
+    ChunkedBody -> case read_chunked config socket rest <<>> deadline {
+      Ok (body, leftover) -> Ok (Just body, leftover)
+      Err e -> Err e
     }
   }
 }
 
-fun validate_body_framing : Config
+fun body_framing : Config
   -> List (String, String)
-  -> Result Unit ParseError
-validate_body_framing config headers = case validate_framing headers {
+  -> Result BodyFraming ParseError
+body_framing config headers = case validate_framing headers {
   Err e -> Err e
   Ok _ -> {
     let te = case find_header "transfer-encoding" headers {
@@ -799,16 +844,16 @@ validate_body_framing config headers = case validate_framing headers {
         if te_val != "chunked" then Err BadRequest
         else case cl {
           Just _ -> Err BadRequest
-          Nothing -> Ok ()
+          Nothing -> Ok ChunkedBody
         }
       Nothing -> case cl {
-        Nothing -> Ok ()
+        Nothing -> Ok NoBody
         Just len_str -> case Int.parse len_str {
           Nothing -> Err BadRequest
           Just len when len < 0 -> Err BadRequest
           Just len ->
             if len > config.max_body_size then Err PayloadTooLarge
-            else Ok ()
+            else Ok (ContentLengthBody len)
         }
       }
     }
@@ -829,24 +874,6 @@ validate_framing headers = case find_all_headers "transfer-encoding" headers {
     h :: tail ->
       if List.all (fun v -> v == h) tail then Ok () else Err BadRequest
   }
-}
-
-fun read_with_content_length : Config
-  -> Tcp.Socket
-  -> BitString
-  -> String
-  -> Int
-  -> Result (Maybe BitString, BitString) ParseError
-  needs {Server}
-read_with_content_length config socket rest len_str deadline = case Int.parse len_str {
-  Nothing -> Err BadRequest
-  # RFC 9110 §8.6: Content-Length is a non-negative integer. A negative
-  # value (or one with a sign prefix) is malformed and must be rejected
-  # before we let it flow into a `<<body:len/binary, ..>>` pattern below.
-  Just len when len < 0 -> Err BadRequest
-  Just len ->
-    if len > config.max_body_size then Err PayloadTooLarge
-    else read_content_length_bytes config socket rest len deadline
 }
 
 fun read_content_length_bytes : Config
