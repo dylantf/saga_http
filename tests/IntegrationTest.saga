@@ -5,6 +5,7 @@ import Std.BitString
 import Std.Test (Testing, Test, describe, test, assert_true, assert_eq)
 import SagaHttp.Http (Response, Chunked, BodyReader, Server, discard_events)
 import SagaHttp.Tcp
+import SagaHttp.WebSocket (WebSocket, FrameOptions, Options)
 
 fun test_port : Int
 test_port = 18765
@@ -24,6 +25,16 @@ fun max_conns_port : Int
 max_conns_port = 18772
 fun streaming_request_port : Int
 streaming_request_port = 18773
+fun websocket_echo_port : Int
+websocket_echo_port = 18774
+fun websocket_ping_port : Int
+websocket_ping_port = 18775
+fun websocket_fragment_port : Int
+websocket_fragment_port = 18776
+fun websocket_limit_port : Int
+websocket_limit_port = 18777
+fun websocket_close_error_port : Int
+websocket_close_error_port = 18778
 
 fun target_label : Http.RequestTarget -> String
 target_label t = case t {
@@ -49,6 +60,7 @@ handle req =
     let (ip, port) = req.peer
     Http.text 200 $"peer: {ip}:{show port}"
   }
+  else if req.path == "/ws" then Http.websocket req websocket_echo_once
   else if req.path
     == "/cookies" then Response {
     status: 200,
@@ -99,6 +111,69 @@ parse_error_label e = case e {
   Http.BodyReadTimeout -> "body read timeout"
 }
 
+fun websocket_echo_once : Unit -> Unit needs {WebSocket}
+websocket_echo_once () = case read_message! () {
+  Ok (Just (WebSocket.TextMessage text)) -> {
+    let _ = send_text! ("echo:" <> text)
+    ()
+  }
+  Ok (Just (WebSocket.BinaryMessage bytes)) -> {
+    let _ = send_binary! bytes
+    ()
+  }
+  _ -> ()
+}
+
+fun websocket_report_error_once : Unit -> Unit needs {WebSocket}
+websocket_report_error_once () = case read_message! () {
+  Err e -> {
+    let _ = send_text! ("error:" <> debug e)
+    ()
+  }
+  _ -> ()
+}
+
+fun run_websocket_server_once : Int -> (Unit -> Unit needs {WebSocket}) -> Unit
+  needs {Process, Actor msg, Timer}
+run_websocket_server_once port app =
+  run_websocket_server_once_with_options port WebSocket.default_options app
+
+fun run_websocket_server_once_with_options :
+  Int -> WebSocket.Options -> (Unit -> Unit needs {WebSocket}) -> Unit
+  needs {Process, Actor msg, Timer}
+run_websocket_server_once_with_options port options app = {
+  let _ = spawn! (fun () -> {
+    case Tcp.listen port 16 {
+      Ok listener -> {
+        case Tcp.accept listener {
+          Ok socket -> WebSocket.run_connection options socket app
+          Err _ -> ()
+        }
+        Tcp.close_listener listener
+      }
+      Err _ -> ()
+    }
+  })
+  sleep! 100
+}
+
+fun websocket_request : Int -> BitString -> Result BitString String
+websocket_request port bytes = case Tcp.connect "127.0.0.1" port 5000 {
+  Err e -> Err e
+  Ok sock -> {
+    let _ = Tcp.send sock bytes
+    let r = recv_all sock <<>>
+    let _ = Tcp.close sock
+    r
+  }
+}
+
+fun server_frame_options : FrameOptions
+server_frame_options = FrameOptions {
+  max_frame_size: 1024,
+  require_mask: False,
+}
+
 # Convert a received BitString to a String for assertion. Tests only use
 # ASCII responses, so the conversion always succeeds.
 fun resp_to_string : BitString -> String
@@ -129,6 +204,17 @@ request_bytes raw = case Tcp.connect "127.0.0.1" test_port 5000 {
   }
 }
 
+fun request_raw_bytes : BitString -> Result BitString String
+request_raw_bytes raw = case Tcp.connect "127.0.0.1" test_port 5000 {
+  Err e -> Err e
+  Ok sock -> {
+    let _ = Tcp.send sock raw
+    let r = recv_all sock <<>>
+    let _ = Tcp.close sock
+    r
+  }
+}
+
 # Send raw bytes on a fresh connection, return the response as a String.
 fun request : String -> Result String String
 request raw = request_on test_port raw
@@ -148,9 +234,8 @@ request_on port raw = case Tcp.connect "127.0.0.1" port 5000 {
 }
 
 # Send two requests on a single connection, returning each response separately.
-fun two_requests : String
-  -> String
-  -> Result (String, Result String String) String
+fun two_requests :
+  String -> String -> Result (String, Result String String) String
 two_requests first second = case Tcp.connect "127.0.0.1" test_port 5000 {
   Err e -> Err e
   Ok sock -> {
@@ -212,7 +297,9 @@ tests () = {
       })
       let _ = spawn! (fun () -> {
         let _ =
-          Http.serve_streaming ({ Http.default_config | port: streaming_request_port }) streaming_handle
+          Http.serve_streaming ({ Http.default_config |
+            port: streaming_request_port,
+          }) streaming_handle
         ()
       })
       sleep! 200
@@ -271,6 +358,164 @@ tests () = {
           assert_contains "HTTP/1.1 200 OK" r
           assert_contains "chunks: hello world" r
         }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "WebSocket runtime reads masked text and sends unmasked text" (fun () -> {
+      let result = {
+        run_websocket_server_once websocket_echo_port websocket_echo_once
+        websocket_request websocket_echo_port <<129, 130, 55, 250, 33, 61, 127, 147>>
+      } with beam_actor
+      case result {
+        Ok bytes -> case WebSocket.decode_frame_with server_frame_options bytes {
+          Ok (frame, leftover) -> {
+            assert_eq frame.opcode WebSocket.Text
+            assert_eq (BitString.to_string frame.payload) (Ok "echo:Hi")
+            assert_eq leftover <<>>
+          }
+          Err _ -> assert_true False
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "WebSocket runtime replies to ping before delivering the next message" (fun () -> {
+      let result = {
+        run_websocket_server_once websocket_ping_port websocket_echo_once
+        let ping = <<137, 128, 1, 2, 3, 4>>
+        let text = <<129, 130, 55, 250, 33, 61, 127, 147>>
+        websocket_request websocket_ping_port (ping <> text)
+      } with beam_actor
+      case result {
+        Ok bytes -> case WebSocket.decode_frame_with server_frame_options bytes {
+          Ok (pong, rest) -> case WebSocket.decode_frame_with server_frame_options rest {
+            Ok (text, leftover) -> {
+              assert_eq pong.opcode WebSocket.Pong
+              assert_eq pong.payload <<>>
+              assert_eq text.opcode WebSocket.Text
+              assert_eq (BitString.to_string text.payload) (Ok "echo:Hi")
+              assert_eq leftover <<>>
+            }
+            Err _ -> assert_true False
+          }
+          Err _ -> assert_true False
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "WebSocket runtime assembles fragmented text with interleaved ping" (fun () -> {
+      let result = {
+        run_websocket_server_once websocket_fragment_port websocket_echo_once
+        let first = <<1, 131, 0, 0, 0, 0, 72, 101, 108>>
+        let ping = <<137, 128, 1, 2, 3, 4>>
+        let last = <<128, 130, 0, 0, 0, 0, 108, 111>>
+        websocket_request websocket_fragment_port (first <> ping <> last)
+      } with beam_actor
+      case result {
+        Ok bytes -> case WebSocket.decode_frame_with server_frame_options bytes {
+          Ok (pong, rest) -> case WebSocket.decode_frame_with server_frame_options rest {
+            Ok (text, leftover) -> {
+              assert_eq pong.opcode WebSocket.Pong
+              assert_eq pong.payload <<>>
+              assert_eq text.opcode WebSocket.Text
+              assert_eq (BitString.to_string text.payload) (Ok "echo:Hello")
+              assert_eq leftover <<>>
+            }
+            Err _ -> assert_true False
+          }
+          Err _ -> assert_true False
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "WebSocket runtime enforces max assembled message size" (fun () -> {
+      let options = Options {
+        max_frame_size: 1024,
+        max_message_size: 4,
+        read_timeout_ms: 30000,
+      }
+      let result = {
+        run_websocket_server_once_with_options websocket_limit_port options websocket_report_error_once
+        let first = <<1, 131, 0, 0, 0, 0, 72, 101, 108>>
+        let last = <<128, 130, 0, 0, 0, 0, 108, 111>>
+        websocket_request websocket_limit_port (first <> last)
+      } with beam_actor
+      case result {
+        Ok bytes -> case WebSocket.decode_frame_with server_frame_options bytes {
+          Ok (frame, leftover) -> {
+            assert_eq frame.opcode WebSocket.Text
+            case BitString.to_string frame.payload {
+              Ok text -> assert_contains "MessageTooLarge(4, 5)" text
+              Err _ -> assert_true False
+            }
+            assert_eq leftover <<>>
+          }
+          Err _ -> assert_true False
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "WebSocket runtime rejects invalid close status codes" (fun () -> {
+      let result = {
+        run_websocket_server_once websocket_close_error_port websocket_report_error_once
+        websocket_request websocket_close_error_port <<136, 130, 0, 0, 0, 0, 3, 237>>
+      } with beam_actor
+      case result {
+        Ok bytes -> case WebSocket.decode_frame_with server_frame_options bytes {
+          Ok (frame, leftover) -> {
+            assert_eq frame.opcode WebSocket.Text
+            case BitString.to_string frame.payload {
+              Ok text -> assert_contains "InvalidCloseCode(1005)" text
+              Err _ -> assert_true False
+            }
+            assert_eq leftover <<>>
+          }
+          Err _ -> assert_true False
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "HTTP upgrade runs a WebSocket handler on the same socket" (fun () -> {
+      let request = BitString.from_string ("GET /ws HTTP/1.1\r\n"
+        <> "Host: localhost\r\n"
+        <> "Upgrade: websocket\r\n"
+        <> "Connection: keep-alive, Upgrade\r\n"
+        <> "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        <> "Sec-WebSocket-Version: 13\r\n"
+        <> "\r\n")
+        <> <<129, 130, 55, 250, 33, 61, 127, 147>>
+      case request_raw_bytes request {
+        Ok response -> case split_head_body response {
+          Just (head, body) -> {
+            assert_contains "HTTP/1.1 101 Switching Protocols" head
+            assert_contains "Upgrade: websocket" head
+            assert_contains "Connection: Upgrade" head
+            assert_contains "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" head
+            case WebSocket.decode_frame_with server_frame_options body {
+              Ok (frame, leftover) -> {
+                assert_eq frame.opcode WebSocket.Text
+                assert_eq (BitString.to_string frame.payload) (Ok "echo:Hi")
+                assert_eq leftover <<>>
+              }
+              Err _ -> assert_true False
+            }
+          }
+          Nothing -> assert_true False
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "HTTP upgrade rejects missing WebSocket keys" (fun () -> {
+      let raw =
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: close, Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n"
+      case request raw {
+        Ok response -> assert_contains "HTTP/1.1 400 Bad Request" response
         Err _ -> assert_true False
       }
     })

@@ -1,0 +1,697 @@
+#@ WebSocket protocol helpers.
+#@
+#@ This module owns WebSocket-specific handshake validation and, eventually,
+#@ frame parsing/encoding. HTTP connection loops live in `SagaHttp.Http`.
+module SagaHttp.WebSocket
+
+import Std.BitString
+import Std.Crypto
+import Std.Int
+import Std.Ref (MutRef, Ref, beam_ref)
+import Std.String
+import SagaHttp.Tcp
+
+#@ Fixed WebSocket GUID from RFC 6455.
+pub fun websocket_guid : String
+websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+#@ Errors returned while validating an HTTP WebSocket upgrade request.
+pub type HandshakeError =
+  | WrongMethod String
+  | UnsupportedHttpVersion
+  | MissingConnectionUpgrade
+  | MissingUpgradeHeader
+  | UnsupportedUpgradeHeader String
+  | MissingWebSocketVersion
+  | UnsupportedWebSocketVersion String
+  | MissingWebSocketKey
+  | InvalidWebSocketKey
+  deriving (Debug, Eq)
+
+#@ Validated handshake metadata needed to send the 101 response.
+pub record Handshake {
+  key: String,
+  accept_key: String,
+} deriving (Debug, Eq)
+
+#@ WebSocket frame opcodes.
+pub type Opcode =
+  | Continuation
+  | Text
+  | Binary
+  | Close
+  | Ping
+  | Pong
+  deriving (Debug, Eq)
+
+#@ A decoded WebSocket frame.
+pub record Frame {
+  fin: Bool,
+  opcode: Opcode,
+  payload: BitString,
+} deriving (Debug, Eq)
+
+#@ Pure frame decoder options.
+pub record FrameOptions {
+  max_frame_size: Int,
+  require_mask: Bool,
+}
+
+#@ Default server-side frame decoder options.
+pub fun default_frame_options : FrameOptions
+default_frame_options = FrameOptions {
+  max_frame_size: 16777216,
+  require_mask: True,
+}
+
+#@ Errors returned while decoding a WebSocket frame.
+pub type FrameError =
+  | IncompleteFrame
+  | ReservedBitsSet
+  | InvalidOpcode Int
+  | ClientFrameNotMasked
+  | FrameTooLarge Int Int
+  | InvalidControlFrame
+  deriving (Debug, Eq)
+
+#@ Messages exposed by the socket-backed WebSocket runtime.
+pub type Message =
+  | TextMessage String
+  | BinaryMessage BitString
+  deriving (Debug, Eq)
+
+#@ Runtime options for a WebSocket connection.
+pub record Options {
+  max_frame_size: Int,
+  max_message_size: Int,
+  read_timeout_ms: Int,
+}
+
+#@ Default WebSocket runtime options.
+pub fun default_options : Options
+default_options = Options {
+  max_frame_size: 16777216,
+  max_message_size: 16777216,
+  read_timeout_ms: 30000,
+}
+
+#@ Errors returned by socket-backed WebSocket operations.
+pub type Error =
+  | FrameDecodeError FrameError
+  | ReadError String
+  | SendError String
+  | TextNotUtf8
+  | UnexpectedContinuation
+  | NewDataFrameDuringFragmentedMessage
+  | MessageTooLarge Int Int
+  | InvalidCloseFrame
+  | InvalidCloseCode Int
+  | CloseReasonTooLarge Int Int
+  deriving (Debug, Eq)
+
+#@ Effect installed while running a WebSocket connection.
+pub effect WebSocket {
+  fun read_message : Unit -> Result (Maybe Message) Error
+  fun send_text : String -> Result Unit Error
+  fun send_binary : BitString -> Result Unit Error
+  fun close_websocket : Int -> String -> Result Unit Error
+}
+
+type RuntimeState =
+  | RuntimeOpen BitString FragmentState
+  | RuntimeClosed
+
+type FragmentState =
+  | NoFragment
+  | FragmentedText BitString
+  | FragmentedBinary BitString
+
+#@ Compute `Sec-WebSocket-Accept` for a client `Sec-WebSocket-Key`.
+#@
+#@ The input must be standard base64 that decodes to 16 bytes.
+pub fun accept_key : String -> Result String HandshakeError
+accept_key key = {
+  let trimmed = String.trim key
+  case Crypto.base64_decode trimmed {
+    Err _ -> Err InvalidWebSocketKey
+    Ok decoded ->
+      if BitString.size decoded == 16 then {
+        let digest =
+          Crypto.sha1_digest (BitString.from_string (trimmed <> websocket_guid))
+        Ok (Crypto.base64_encode digest)
+      }
+      else Err InvalidWebSocketKey
+  }
+}
+
+#@ Validate WebSocket upgrade headers and compute the accept key.
+pub fun validate_handshake :
+  String -> Bool -> List (String, String) -> Result Handshake HandshakeError
+validate_handshake method http_1_1 headers =
+  if method != "GET" then Err (WrongMethod method)
+  else if not http_1_1 then Err UnsupportedHttpVersion
+  else validate_handshake_headers headers
+
+#@ Headers required for a successful `101 Switching Protocols` response.
+pub fun response_headers : Handshake -> List (String, String)
+response_headers handshake = [
+  ("Upgrade", "websocket"),
+  ("Connection", "Upgrade"),
+  ("Sec-WebSocket-Accept", handshake.accept_key),
+]
+
+fun validate_handshake_headers :
+  List (String, String) -> Result Handshake HandshakeError
+validate_handshake_headers headers =
+  if not (has_connection_token "upgrade" headers) then Err MissingConnectionUpgrade
+  else case find_header "upgrade" headers {
+    Nothing -> Err MissingUpgradeHeader
+    Just value ->
+      if String.to_lower (String.trim value) != "websocket" then {
+        Err (UnsupportedUpgradeHeader value)
+      }
+      else validate_version_header headers
+  }
+
+fun validate_version_header :
+  List (String, String) -> Result Handshake HandshakeError
+validate_version_header headers = case find_header "sec-websocket-version" headers {
+  Nothing -> Err MissingWebSocketVersion
+  Just value ->
+    if String.trim value == "13" then validate_key_header headers
+    else Err (UnsupportedWebSocketVersion value)
+}
+
+fun validate_key_header :
+  List (String, String) -> Result Handshake HandshakeError
+validate_key_header headers = case find_header "sec-websocket-key" headers {
+  Nothing -> Err MissingWebSocketKey
+  Just key -> case accept_key key {
+    Err e -> Err e
+    Ok accept -> Ok (Handshake { key: String.trim key, accept_key: accept })
+  }
+}
+
+fun has_connection_token : String -> List (String, String) -> Bool
+has_connection_token token headers =
+  List.any (header_value_has_token token) (find_all_headers "connection" headers)
+
+fun header_value_has_token : String -> String -> Bool
+header_value_has_token token value =
+  List.contains (String.to_lower token) (String.split "," value
+  |> List.map String.trim
+  |> List.map String.to_lower)
+
+fun find_header : String -> List (String, String) -> Maybe String
+find_header name headers = find_header_loop (String.to_lower name) headers
+
+fun find_header_loop : String -> List (String, String) -> Maybe String
+find_header_loop _ [] = Nothing
+find_header_loop target ((n, v) :: rest) =
+  if String.to_lower n == target then Just v
+  else find_header_loop target rest
+
+fun find_all_headers : String -> List (String, String) -> List String
+find_all_headers name headers = {
+  let target = String.to_lower name
+  List.filter_map (fun (n, v) -> {
+    if String.to_lower n == target then Just v
+    else Nothing
+  }) headers
+}
+
+#@ Decode one client-to-server frame and return the leftover bytes.
+pub fun decode_client_frame : BitString -> Result (Frame, BitString) FrameError
+decode_client_frame bytes = decode_frame_with default_frame_options bytes
+
+#@ Decode one frame with explicit options and return the leftover bytes.
+pub fun decode_frame_with :
+  FrameOptions -> BitString -> Result (Frame, BitString) FrameError
+decode_frame_with options bytes = case bytes {
+  <<fin_bit:1, rsv1:1, rsv2:1, rsv3:1, opcode_raw:4, mask_bit:1, len_code:7, rest/binary>> ->
+    if rsv1 != 0 || rsv2 != 0 || rsv3 != 0 then Err ReservedBitsSet
+    else case opcode_from_int opcode_raw {
+      Nothing -> Err (InvalidOpcode opcode_raw)
+      Just opcode ->
+        decode_frame_payload options (fin_bit
+          == 1) opcode (mask_bit == 1) len_code rest
+    }
+  _ -> Err IncompleteFrame
+}
+
+fun decode_frame_payload :
+     FrameOptions
+  -> Bool
+  -> Opcode
+  -> Bool
+  -> Int
+  -> BitString
+  -> Result (Frame, BitString) FrameError
+decode_frame_payload options fin opcode masked len_code rest =
+  if options.require_mask && not masked then Err ClientFrameNotMasked
+  else case decode_payload_length len_code rest {
+    Err e -> Err e
+    Ok (payload_len, after_len) ->
+      if payload_len > options.max_frame_size then {
+        Err (FrameTooLarge options.max_frame_size payload_len)
+      }
+      else if control_frame opcode
+        && (not fin || payload_len > 125) then Err InvalidControlFrame
+      else decode_payload_bytes opcode fin masked payload_len after_len
+  }
+
+fun decode_payload_length :
+  Int -> BitString -> Result (Int, BitString) FrameError
+decode_payload_length len_code rest =
+  if len_code < 126 then Ok (len_code, rest)
+  else if len_code == 126 then case rest {
+    <<payload_len:16, after_len/binary>> -> Ok (payload_len, after_len)
+    _ -> Err IncompleteFrame
+  }
+  else case rest {
+    <<payload_len:64, after_len/binary>> -> Ok (payload_len, after_len)
+    _ -> Err IncompleteFrame
+  }
+
+fun decode_payload_bytes :
+     Opcode
+  -> Bool
+  -> Bool
+  -> Int
+  -> BitString
+  -> Result (Frame, BitString) FrameError
+decode_payload_bytes opcode fin masked payload_len bytes =
+  if masked then case bytes {
+    <<m0:8, m1:8, m2:8, m3:8, after_mask/binary>> ->
+      split_payload opcode fin payload_len after_mask (Just (m0, m1, m2, m3))
+    _ -> Err IncompleteFrame
+  }
+  else split_payload opcode fin payload_len bytes Nothing
+
+fun split_payload :
+     Opcode
+  -> Bool
+  -> Int
+  -> BitString
+  -> Maybe (Int, Int, Int, Int)
+  -> Result (Frame, BitString) FrameError
+split_payload opcode fin payload_len bytes mask =
+  if BitString.size bytes < payload_len then Err IncompleteFrame
+  else case bytes {
+    <<raw:payload_len/binary, leftover/binary>> -> {
+      let payload = case mask {
+        Nothing -> raw
+        Just (m0, m1, m2, m3) -> apply_mask raw m0 m1 m2 m3
+      }
+      Ok (Frame { fin: fin, opcode: opcode, payload: payload }, leftover)
+    }
+    _ -> Err IncompleteFrame
+  }
+
+#@ Encode one server-to-client frame.
+pub fun encode_frame : Opcode -> BitString -> BitString
+encode_frame opcode payload = {
+  let first = BitString.from_byte (128 + opcode_to_int opcode)
+  let len = BitString.size payload
+  if len <= 125 then first <> BitString.from_byte len <> payload
+  else if len <= 65535 then first
+    <> BitString.from_byte 126
+    <> <<len:16>>
+    <> payload
+  else first <> BitString.from_byte 127 <> <<len:64>> <> payload
+}
+
+#@ Encode an unfragmented server text frame.
+pub fun encode_text_frame : String -> BitString
+encode_text_frame text = encode_frame Text (BitString.from_string text)
+
+#@ Run a handler with a socket-backed WebSocket effect.
+#@
+#@ The socket is closed when the handler returns.
+pub fun run_connection :
+  Options -> Tcp.Socket -> (Unit -> Unit needs {WebSocket}) -> Unit
+run_connection options socket app = run_connection_with options socket <<>> app
+
+#@ Run a handler with already-read WebSocket frame bytes.
+pub fun run_connection_with :
+  Options -> Tcp.Socket -> BitString -> (Unit -> Unit needs {WebSocket}) -> Unit
+run_connection_with options socket initial app = {
+  let state = new! (RuntimeOpen initial NoFragment)
+  let websocket = websocket_socket options socket state
+  let _ = app () with websocket
+  Tcp.close socket
+} with beam_ref
+
+fun websocket_socket :
+  Options -> Tcp.Socket -> MutRef RuntimeState -> Handler WebSocket
+  needs {Ref}
+websocket_socket options socket state = handler for WebSocket needs {Ref} {
+  read_message _ = resume runtime_read_message options socket state
+  send_text text = resume runtime_send_text socket text
+  send_binary bytes = resume runtime_send_frame socket Binary bytes
+  close_websocket code reason = resume runtime_close socket state code reason
+}
+
+fun runtime_read_message :
+  Options -> Tcp.Socket -> MutRef RuntimeState -> Result (Maybe Message) Error
+  needs {Ref}
+runtime_read_message options socket state = case get! state {
+  RuntimeClosed -> Ok Nothing
+  RuntimeOpen buffer fragment ->
+    read_message_loop options socket state buffer fragment
+}
+
+fun read_message_loop :
+     Options
+  -> Tcp.Socket
+  -> MutRef RuntimeState
+  -> BitString
+  -> FragmentState
+  -> Result (Maybe Message) Error
+  needs {Ref}
+read_message_loop options socket state buffer fragment = {
+  let frame_options = FrameOptions {
+    max_frame_size: options.max_frame_size,
+    require_mask: True,
+  }
+  case decode_frame_with frame_options buffer {
+    Ok (frame, leftover) -> {
+      set! state (RuntimeOpen leftover fragment)
+      handle_runtime_frame options socket state frame fragment
+    }
+    Err IncompleteFrame -> case Tcp.recv socket 0 options.read_timeout_ms {
+      Ok more ->
+        read_message_loop options socket state (buffer <> more) fragment
+      Err "closed" -> {
+        set! state RuntimeClosed
+        Ok Nothing
+      }
+      Err reason -> {
+        set! state RuntimeClosed
+        Err (ReadError reason)
+      }
+    }
+    Err e -> {
+      set! state RuntimeClosed
+      Err (FrameDecodeError e)
+    }
+  }
+}
+
+fun handle_runtime_frame :
+     Options
+  -> Tcp.Socket
+  -> MutRef RuntimeState
+  -> Frame
+  -> FragmentState
+  -> Result (Maybe Message) Error
+  needs {Ref}
+handle_runtime_frame options socket state frame fragment = case frame.opcode {
+  Text -> handle_text_frame options socket state frame fragment
+  Binary -> handle_binary_frame options socket state frame fragment
+  Continuation -> handle_continuation_frame options socket state frame fragment
+  Ping -> case runtime_send_frame socket Pong frame.payload {
+    Ok _ -> runtime_read_message options socket state
+    Err e -> Err e
+  }
+  Pong -> runtime_read_message options socket state
+  Close -> handle_close_frame socket state frame
+}
+
+fun handle_text_frame :
+     Options
+  -> Tcp.Socket
+  -> MutRef RuntimeState
+  -> Frame
+  -> FragmentState
+  -> Result (Maybe Message) Error
+  needs {Ref}
+handle_text_frame options socket state frame fragment = case fragment {
+  NoFragment ->
+    if frame.fin then complete_text_message options frame.payload
+    else start_text_fragment options socket state frame.payload
+  _ -> Err NewDataFrameDuringFragmentedMessage
+}
+
+fun handle_binary_frame :
+     Options
+  -> Tcp.Socket
+  -> MutRef RuntimeState
+  -> Frame
+  -> FragmentState
+  -> Result (Maybe Message) Error
+  needs {Ref}
+handle_binary_frame options socket state frame fragment = case fragment {
+  NoFragment ->
+    if frame.fin then complete_binary_message options frame.payload
+    else start_binary_fragment options socket state frame.payload
+  _ -> Err NewDataFrameDuringFragmentedMessage
+}
+
+fun handle_continuation_frame :
+     Options
+  -> Tcp.Socket
+  -> MutRef RuntimeState
+  -> Frame
+  -> FragmentState
+  -> Result (Maybe Message) Error
+  needs {Ref}
+handle_continuation_frame options socket state frame fragment = case fragment {
+  NoFragment -> Err UnexpectedContinuation
+  FragmentedText acc ->
+    continue_text_fragment options socket state acc frame.payload frame.fin
+  FragmentedBinary acc ->
+    continue_binary_fragment options socket state acc frame.payload frame.fin
+}
+
+fun start_text_fragment :
+     Options
+  -> Tcp.Socket
+  -> MutRef RuntimeState
+  -> BitString
+  -> Result (Maybe Message) Error
+  needs {Ref}
+start_text_fragment options socket state payload = case validate_message_size options payload {
+  Err e -> Err e
+  Ok _ -> {
+    set_fragment_state state (FragmentedText payload)
+    runtime_read_message options socket state
+  }
+}
+
+fun start_binary_fragment :
+     Options
+  -> Tcp.Socket
+  -> MutRef RuntimeState
+  -> BitString
+  -> Result (Maybe Message) Error
+  needs {Ref}
+start_binary_fragment options socket state payload = case validate_message_size options payload {
+  Err e -> Err e
+  Ok _ -> {
+    set_fragment_state state (FragmentedBinary payload)
+    runtime_read_message options socket state
+  }
+}
+
+fun continue_text_fragment :
+     Options
+  -> Tcp.Socket
+  -> MutRef RuntimeState
+  -> BitString
+  -> BitString
+  -> Bool
+  -> Result (Maybe Message) Error
+  needs {Ref}
+continue_text_fragment options socket state acc payload fin = {
+  let joined = acc <> payload
+  case validate_message_size options joined {
+    Err e -> Err e
+    Ok _ ->
+      if fin then {
+        set_fragment_state state NoFragment
+        complete_text_message options joined
+      }
+      else {
+        set_fragment_state state (FragmentedText joined)
+        runtime_read_message options socket state
+      }
+  }
+}
+
+fun continue_binary_fragment :
+     Options
+  -> Tcp.Socket
+  -> MutRef RuntimeState
+  -> BitString
+  -> BitString
+  -> Bool
+  -> Result (Maybe Message) Error
+  needs {Ref}
+continue_binary_fragment options socket state acc payload fin = {
+  let joined = acc <> payload
+  case validate_message_size options joined {
+    Err e -> Err e
+    Ok _ ->
+      if fin then {
+        set_fragment_state state NoFragment
+        complete_binary_message options joined
+      }
+      else {
+        set_fragment_state state (FragmentedBinary joined)
+        runtime_read_message options socket state
+      }
+  }
+}
+
+fun complete_text_message : Options -> BitString -> Result (Maybe Message) Error
+complete_text_message options payload = case validate_message_size options payload {
+  Err e -> Err e
+  Ok _ -> case BitString.to_string payload {
+    Ok text -> Ok (Just (TextMessage text))
+    Err _ -> Err TextNotUtf8
+  }
+}
+
+fun complete_binary_message :
+  Options -> BitString -> Result (Maybe Message) Error
+complete_binary_message options payload = case validate_message_size options payload {
+  Err e -> Err e
+  Ok _ -> Ok (Just (BinaryMessage payload))
+}
+
+fun validate_message_size : Options -> BitString -> Result Unit Error
+validate_message_size options payload = {
+  let actual = BitString.size payload
+  if actual > options.max_message_size then {
+    Err (MessageTooLarge options.max_message_size actual)
+  }
+  else Ok ()
+}
+
+fun set_fragment_state : MutRef RuntimeState -> FragmentState -> Unit
+  needs {Ref}
+set_fragment_state state fragment = case get! state {
+  RuntimeOpen buffer _ -> set! state (RuntimeOpen buffer fragment)
+  RuntimeClosed -> ()
+}
+
+fun handle_close_frame :
+  Tcp.Socket -> MutRef RuntimeState -> Frame -> Result (Maybe Message) Error
+  needs {Ref}
+handle_close_frame socket state frame = case validate_close_payload frame.payload {
+  Err e -> {
+    set! state RuntimeClosed
+    Err e
+  }
+  Ok _ -> {
+    let _ = runtime_send_frame socket Close frame.payload
+    set! state RuntimeClosed
+    Ok Nothing
+  }
+}
+
+fun runtime_send_text : Tcp.Socket -> String -> Result Unit Error
+runtime_send_text socket text =
+  runtime_send_frame socket Text (BitString.from_string text)
+
+fun runtime_send_frame : Tcp.Socket -> Opcode -> BitString -> Result Unit Error
+runtime_send_frame socket opcode payload = case Tcp.send socket (encode_frame opcode payload) {
+  Ok _ -> Ok ()
+  Err reason -> Err (SendError reason)
+}
+
+fun runtime_close :
+  Tcp.Socket -> MutRef RuntimeState -> Int -> String -> Result Unit Error
+  needs {Ref}
+runtime_close socket state code reason = case close_payload code reason {
+  Err e -> Err e
+  Ok payload -> {
+    set! state RuntimeClosed
+    runtime_send_frame socket Close payload
+  }
+}
+
+#@ Returns True when a WebSocket close status code is valid on the wire.
+pub fun valid_close_code : Int -> Bool
+valid_close_code code = code >= 1000
+  && code <= 1014
+  && code != 1004
+  && code != 1005
+  && code != 1006
+  || code >= 3000 && code <= 4999
+
+fun close_payload : Int -> String -> Result BitString Error
+close_payload code reason =
+  if not (valid_close_code code) then Err (InvalidCloseCode code)
+  else {
+    let reason_bytes = BitString.from_string reason
+    let reason_size = BitString.size reason_bytes
+    if reason_size > 123 then Err (CloseReasonTooLarge 123 reason_size)
+    else Ok (<<code:16>> <> reason_bytes)
+  }
+
+fun validate_close_payload : BitString -> Result Unit Error
+validate_close_payload payload =
+  if BitString.size payload == 0 then Ok ()
+  else if BitString.size payload == 1 then Err InvalidCloseFrame
+  else case payload {
+    <<code:16, reason/binary>> ->
+      if not (valid_close_code code) then Err (InvalidCloseCode code)
+      else case BitString.to_string reason {
+        Ok _ -> Ok ()
+        Err _ -> Err TextNotUtf8
+      }
+    _ -> Err InvalidCloseFrame
+  }
+
+fun opcode_to_int : Opcode -> Int
+opcode_to_int opcode = case opcode {
+  Continuation -> 0
+  Text -> 1
+  Binary -> 2
+  Close -> 8
+  Ping -> 9
+  Pong -> 10
+}
+
+fun opcode_from_int : Int -> Maybe Opcode
+opcode_from_int opcode = case opcode {
+  0 -> Just Continuation
+  1 -> Just Text
+  2 -> Just Binary
+  8 -> Just Close
+  9 -> Just Ping
+  10 -> Just Pong
+  _ -> Nothing
+}
+
+fun control_frame : Opcode -> Bool
+control_frame opcode = case opcode {
+  Close -> True
+  Ping -> True
+  Pong -> True
+  _ -> False
+}
+
+fun apply_mask : BitString -> Int -> Int -> Int -> Int -> BitString
+apply_mask payload m0 m1 m2 m3 = apply_mask_loop payload m0 m1 m2 m3 0 <<>>
+
+fun apply_mask_loop :
+  BitString -> Int -> Int -> Int -> Int -> Int -> BitString -> BitString
+apply_mask_loop payload m0 m1 m2 m3 index acc = case payload {
+  <<>> -> acc
+  <<byte:8, rest/binary>> -> {
+    let key = mask_byte index m0 m1 m2 m3
+    apply_mask_loop rest m0 m1 m2 m3 (index
+      + 1) (acc <> BitString.from_byte (Int.bxor byte key))
+  }
+}
+
+fun mask_byte : Int -> Int -> Int -> Int -> Int -> Int
+mask_byte index m0 m1 m2 m3 = case index % 4 {
+  0 -> m0
+  1 -> m1
+  2 -> m2
+  _ -> m3
+}

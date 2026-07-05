@@ -1,0 +1,199 @@
+module WebSocketTest
+
+import Std.BitString
+import Std.List
+import Std.Test (Testing, describe, test, assert_eq)
+import SagaHttp.WebSocket (Handshake, FrameOptions, Frame)
+
+fun valid_headers : List (String, String)
+valid_headers = [
+  ("host", "server.example.com"),
+  ("upgrade", "websocket"),
+  ("connection", "keep-alive, Upgrade"),
+  ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+  ("sec-websocket-version", "13"),
+]
+
+pub fun tests : Unit -> Unit needs {Testing}
+tests () = {
+  describe "WebSocket handshake" (fun () -> {
+    test "accept_key computes the RFC 6455 example value" (fun () -> {
+      assert_eq (WebSocket.accept_key "dGhlIHNhbXBsZSBub25jZQ==") (Ok "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+    })
+
+    test "validate_handshake accepts a valid upgrade request" (fun () -> {
+      assert_eq (WebSocket.validate_handshake "GET" True valid_headers) (Ok (Handshake {
+        key: "dGhlIHNhbXBsZSBub25jZQ==",
+        accept_key: "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+      }))
+    })
+
+    test "validate_handshake rejects non-GET methods" (fun () -> {
+      assert_eq (WebSocket.validate_handshake "POST" True valid_headers) (Err (WebSocket.WrongMethod "POST"))
+    })
+
+    test "validate_handshake requires HTTP/1.1" (fun () -> {
+      assert_eq (WebSocket.validate_handshake "GET" False valid_headers) (Err WebSocket.UnsupportedHttpVersion)
+    })
+
+    test "validate_handshake requires Connection: upgrade token" (fun () -> {
+      let headers = [
+        ("upgrade", "websocket"),
+        ("connection", "keep-alive"),
+        ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ("sec-websocket-version", "13"),
+      ]
+      assert_eq (WebSocket.validate_handshake "GET" True headers) (Err WebSocket.MissingConnectionUpgrade)
+    })
+
+    test "validate_handshake rejects wrong Upgrade value" (fun () -> {
+      let headers = [
+        ("upgrade", "h2c"),
+        ("connection", "upgrade"),
+        ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ("sec-websocket-version", "13"),
+      ]
+      assert_eq (WebSocket.validate_handshake "GET" True headers) (Err (WebSocket.UnsupportedUpgradeHeader "h2c"))
+    })
+
+    test "validate_handshake requires WebSocket version 13" (fun () -> {
+      let headers = [
+        ("upgrade", "websocket"),
+        ("connection", "upgrade"),
+        ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ("sec-websocket-version", "12"),
+      ]
+      assert_eq (WebSocket.validate_handshake "GET" True headers) (Err (WebSocket.UnsupportedWebSocketVersion "12"))
+    })
+
+    test "validate_handshake rejects invalid keys" (fun () -> {
+      let headers = [
+        ("upgrade", "websocket"),
+        ("connection", "upgrade"),
+        ("sec-websocket-key", "bad-key"),
+        ("sec-websocket-version", "13"),
+      ]
+      assert_eq (WebSocket.validate_handshake "GET" True headers) (Err WebSocket.InvalidWebSocketKey)
+    })
+
+    test "response_headers builds 101 response headers" (fun () -> {
+      let handshake = Handshake {
+        key: "dGhlIHNhbXBsZSBub25jZQ==",
+        accept_key: "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+      }
+      assert_eq (WebSocket.response_headers handshake) [
+        ("Upgrade", "websocket"),
+        ("Connection", "Upgrade"),
+        ("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+      ]
+    })
+  })
+
+  describe "WebSocket frame codec" (fun () -> {
+    test "decode_client_frame unmasks a text frame" (fun () -> {
+      let frame_bytes = <<129, 130, 55, 250, 33, 61, 127, 147>>
+      assert_eq (WebSocket.decode_client_frame frame_bytes) (Ok (
+        Frame {
+          fin: True,
+          opcode: WebSocket.Text,
+          payload: BitString.from_string "Hi",
+        },
+        <<>>,
+      ))
+    })
+
+    test "decode_client_frame returns leftover bytes" (fun () -> {
+      let frame_bytes = <<129, 130, 55, 250, 33, 61, 127, 147, 1, 2>>
+      case WebSocket.decode_client_frame frame_bytes {
+        Ok (_, leftover) -> assert_eq leftover <<1, 2>>
+        Err _ -> assert_eq True False
+      }
+    })
+
+    test "decode_client_frame rejects unmasked client frames" (fun () -> {
+      assert_eq (WebSocket.decode_client_frame (WebSocket.encode_text_frame "Hi")) (Err WebSocket.ClientFrameNotMasked)
+    })
+
+    test "decode_frame_with can decode unmasked server frames" (fun () -> {
+      let options = FrameOptions { max_frame_size: 1024, require_mask: False }
+      assert_eq (WebSocket.decode_frame_with options (WebSocket.encode_text_frame "Hi")) (Ok (
+        Frame {
+          fin: True,
+          opcode: WebSocket.Text,
+          payload: BitString.from_string "Hi",
+        },
+        <<>>,
+      ))
+    })
+
+    test "encode_text_frame writes an unmasked server text frame" (fun () -> {
+      assert_eq (WebSocket.encode_text_frame "Hi") <<129, 2, 72, 105>>
+    })
+
+    test "encode_frame uses 16-bit extended lengths" (fun () -> {
+      let payload = BitString.from_string (String.repeat 126 "a")
+      let bytes = WebSocket.encode_frame WebSocket.Binary payload
+      assert_eq (List.take 4 (BitString.to_list bytes)) [130, 126, 0, 126]
+    })
+
+    test "encode_frame uses 64-bit extended lengths" (fun () -> {
+      let payload = BitString.from_string (String.repeat 66000 "a")
+      let bytes = WebSocket.encode_frame WebSocket.Binary payload
+      assert_eq (List.take 10 (BitString.to_list bytes)) [
+        130,
+        127,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        208,
+      ]
+    })
+
+    test "decode_frame_with enforces max frame size" (fun () -> {
+      let options = FrameOptions { max_frame_size: 1, require_mask: True }
+      let frame_bytes = <<129, 130, 55, 250, 33, 61, 127, 147>>
+      assert_eq (WebSocket.decode_frame_with options frame_bytes) (Err (WebSocket.FrameTooLarge 1 2))
+    })
+
+    test "decode_client_frame rejects reserved bits" (fun () -> {
+      assert_eq (WebSocket.decode_client_frame <<193, 128, 1, 2, 3, 4>>) (Err WebSocket.ReservedBitsSet)
+    })
+
+    test "decode_client_frame rejects unknown opcodes" (fun () -> {
+      assert_eq (WebSocket.decode_client_frame <<131, 128, 1, 2, 3, 4>>) (Err (WebSocket.InvalidOpcode 3))
+    })
+
+    test "decode_client_frame rejects fragmented control frames" (fun () -> {
+      assert_eq (WebSocket.decode_client_frame <<9, 128, 1, 2, 3, 4>>) (Err WebSocket.InvalidControlFrame)
+    })
+
+    test "decode_client_frame rejects oversized control frames" (fun () -> {
+      let payload = BitString.from_string (String.repeat 126 "a")
+      let frame_bytes = <<137, 254, 0, 126, 0, 0, 0, 0>> <> payload
+      assert_eq (WebSocket.decode_client_frame frame_bytes) (Err WebSocket.InvalidControlFrame)
+    })
+
+    test "decode_client_frame reports incomplete frames" (fun () -> {
+      assert_eq (WebSocket.decode_client_frame <<129, 130, 1>>) (Err WebSocket.IncompleteFrame)
+    })
+
+    test "valid_close_code accepts normal and private codes" (fun () -> {
+      assert_eq (WebSocket.valid_close_code 1000) True
+      assert_eq (WebSocket.valid_close_code 1014) True
+      assert_eq (WebSocket.valid_close_code 3000) True
+      assert_eq (WebSocket.valid_close_code 4999) True
+    })
+
+    test "valid_close_code rejects reserved and out-of-range codes" (fun () -> {
+      assert_eq (WebSocket.valid_close_code 999) False
+      assert_eq (WebSocket.valid_close_code 1004) False
+      assert_eq (WebSocket.valid_close_code 1005) False
+      assert_eq (WebSocket.valid_close_code 1006) False
+      assert_eq (WebSocket.valid_close_code 5000) False
+    })
+  })
+}
