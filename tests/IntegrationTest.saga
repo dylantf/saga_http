@@ -3,7 +3,7 @@ module IntegrationTest
 import Std.Actor (Process, Actor, Monitor, Timer, beam_actor)
 import Std.BitString
 import Std.Test (Testing, Test, describe, test, assert_true, assert_eq)
-import SagaHttp.Http (Response, Chunked, Server, discard_events)
+import SagaHttp.Http (Response, Chunked, BodyReader, Server, discard_events)
 import SagaHttp.Tcp
 
 fun test_port : Int
@@ -22,6 +22,8 @@ fun body_deadline_port : Int
 body_deadline_port = 18771
 fun max_conns_port : Int
 max_conns_port = 18772
+fun streaming_request_port : Int
+streaming_request_port = 18773
 
 fun target_label : Http.RequestTarget -> String
 target_label t = case t {
@@ -66,6 +68,37 @@ handle req =
       Http.text 200 $"path: {req.path} target: {target_label req.target}"
   }
 
+fun streaming_handle : Http.StreamingRequest -> Http.Response needs {BodyReader}
+streaming_handle req =
+  if req.path == "/stream-echo" then case read_body_all! () {
+    Ok body -> case BitString.to_string body {
+      Ok s -> Http.text 200 $"stream echo: {s}"
+      Err _ -> Http.text 500 "binary body"
+    }
+    Err e -> Http.text 400 $"body error: {parse_error_label e}"
+  }
+  else if req.path == "/stream-chunks" then streaming_chunks_loop <<>>
+  else Http.text 200 $"stream path: {req.path}"
+
+fun streaming_chunks_loop : BitString -> Http.Response needs {BodyReader}
+streaming_chunks_loop acc = case read_body_chunk! () {
+  Err e -> Http.text 400 $"body error: {parse_error_label e}"
+  Ok Nothing -> case BitString.to_string acc {
+    Ok s -> Http.text 200 $"chunks: {s}"
+    Err _ -> Http.text 500 "binary body"
+  }
+  Ok (Just chunk) -> streaming_chunks_loop (acc <> chunk)
+}
+
+fun parse_error_label : Http.ParseError -> String
+parse_error_label e = case e {
+  Http.BadRequest -> "bad request"
+  Http.PayloadTooLarge -> "payload too large"
+  Http.ExpectationFailed -> "expectation failed"
+  Http.UnsupportedVersion -> "unsupported version"
+  Http.BodyReadTimeout -> "body read timeout"
+}
+
 # Convert a received BitString to a String for assertion. Tests only use
 # ASCII responses, so the conversion always succeeds.
 fun resp_to_string : BitString -> String
@@ -98,7 +131,10 @@ request_bytes raw = case Tcp.connect "127.0.0.1" test_port 5000 {
 
 # Send raw bytes on a fresh connection, return the response as a String.
 fun request : String -> Result String String
-request raw = case Tcp.connect "127.0.0.1" test_port 5000 {
+request raw = request_on test_port raw
+
+fun request_on : Int -> String -> Result String String
+request_on port raw = case Tcp.connect "127.0.0.1" port 5000 {
   Err e -> Err e
   Ok sock -> {
     let _ = Tcp.send sock (BitString.from_string raw)
@@ -174,6 +210,11 @@ tests () = {
         let _ = Http.serve ({ Http.default_config | port: test_port }) handle
         ()
       })
+      let _ = spawn! (fun () -> {
+        let _ =
+          Http.serve_streaming ({ Http.default_config | port: streaming_request_port }) streaming_handle
+        ()
+      })
       sleep! 200
     } with {beam_actor, discard_events}
 
@@ -207,6 +248,28 @@ tests () = {
         Ok r -> {
           assert_contains "HTTP/1.1 200 OK" r
           assert_contains "echo: hello" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "serve_streaming reads Content-Length bodies through BodyReader" (fun () -> {
+      case request_on streaming_request_port "POST /stream-echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world" {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "stream echo: hello world" r
+        }
+        Err _ -> assert_true False
+      }
+    })
+
+    test "serve_streaming reads chunked bodies one chunk at a time" (fun () -> {
+      let req = "POST /stream-chunks HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        <> "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+      case request_on streaming_request_port req {
+        Ok r -> {
+          assert_contains "HTTP/1.1 200 OK" r
+          assert_contains "chunks: hello world" r
         }
         Err _ -> assert_true False
       }
